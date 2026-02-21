@@ -18,6 +18,8 @@ from typing import List, Dict, Any, Optional, Literal
 import sys
 import os
 import time
+import atexit
+import re
 import urllib.request
 import urllib.error
 from pydantic import Field
@@ -52,6 +54,339 @@ _telegram_last_update_id: Optional[int] = None
 
 # Delineator used to separate AI output from user input in multiline dialog
 MULTILINE_DELINEATOR = "─" * 50
+
+# ── Session Coordination for Multi-Instance Telegram HITL ──────────────────
+
+class SessionCoordinator:
+    """Manages multi-instance session coordination for Telegram HITL.
+
+    When multiple VS Code windows run HITL MCP servers simultaneously,
+    this coordinator:
+    - Assigns each instance a unique session number (#1-#9)
+    - Tags outgoing Telegram messages with session info
+    - Routes incoming replies to the correct instance
+    - Provides inline keyboard buttons for easy session switching
+    - Handles /sessions and /r{n} commands
+    """
+
+    BASE_DIR = os.path.join(os.path.expanduser("~"), ".hitl-mcp")
+    SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
+    OFFSET_FILE = os.path.join(BASE_DIR, "telegram_offset.json")
+    RESPONSES_DIR = os.path.join(BASE_DIR, "responses")
+    POLL_LOCK_FILE = os.path.join(BASE_DIR, "poll.lock")
+    MESSAGE_MAP_FILE = os.path.join(BASE_DIR, "message_map.json")
+    ACTIVE_CONTEXT_FILE = os.path.join(BASE_DIR, "active_context.json")
+
+    SESSION_ICONS = ["🔵", "🟢", "🟡", "🟠", "🔴", "🟣", "⚪", "🟤", "⚫"]
+
+    def __init__(self):
+        self.session_id: Optional[str] = None
+        self.session_number: Optional[int] = None
+        self.workspace_name: Optional[str] = None
+        self.pid = os.getpid()
+        self._lock_fd = None
+        self._is_poller = False
+        self._registered = False
+        os.makedirs(self.BASE_DIR, exist_ok=True)
+        os.makedirs(self.RESPONSES_DIR, exist_ok=True)
+
+    # ── Helpers ──
+
+    def _get_workspace_name(self) -> str:
+        """Detect a human-readable workspace name for this session.
+
+        Priority:
+        1. HITL_SESSION_NAME env var  (set "${workspaceFolderBasename}" in mcp.json)
+        2. VSCODE_CWD / VSCODE_WORKSPACE_FOLDER env vars
+        3. Script's parent directory name
+        4. CWD (skip VS Code install dir)
+        5. Fallback to PID-based name
+        """
+        # 1. Explicit env var — works perfectly with VS Code variable substitution
+        name = os.getenv("HITL_SESSION_NAME", "").strip()
+        if name:
+            return name
+
+        # 2. VS Code env vars
+        for var in ("VSCODE_CWD", "VSCODE_WORKSPACE_FOLDER", "WORKSPACE_FOLDER"):
+            val = os.getenv(var, "").strip()
+            if val and os.path.isdir(val):
+                return os.path.basename(val)
+
+        # 3. Script's parent directory
+        if sys.argv:
+            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            dirname = os.path.basename(script_dir)
+            skip = {"scripts", "bin", "__pycache__", "site-packages", ".tmp"}
+            if dirname and dirname.lower() not in skip:
+                return dirname
+
+        # 4. CWD (skip common VS Code install dirs)
+        cwd_name = os.path.basename(os.getcwd())
+        if cwd_name and "vs code" not in cwd_name.lower() and cwd_name.lower() != "code":
+            return cwd_name
+
+        return f"Session-{os.getpid()}"
+
+    def _json_read(self, filepath: str) -> Any:
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except (json.JSONDecodeError, IOError, OSError):
+            pass
+        return None
+
+    def _json_write(self, filepath: str, data: Any):
+        tmp = filepath + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, filepath)
+        except OSError:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+    def _is_pid_alive(self, pid: int) -> bool:
+        if IS_WINDOWS:
+            try:
+                import ctypes
+                SYNCHRONIZE = 0x00100000
+                handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+                if handle:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    return True
+                return False
+            except Exception:
+                return False
+        else:
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+
+    # ── Session registry ──
+
+    def _read_sessions(self) -> Dict[str, Any]:
+        data = self._json_read(self.SESSIONS_FILE)
+        return data if isinstance(data, dict) and "sessions" in data else {"sessions": {}}
+
+    def _write_sessions(self, data: Dict[str, Any]):
+        self._json_write(self.SESSIONS_FILE, data)
+
+    def _cleanup_stale(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        sessions = data.get("sessions", {})
+        data["sessions"] = {
+            sid: info for sid, info in sessions.items()
+            if self._is_pid_alive(info.get("pid", 0))
+        }
+        return data
+
+    def register(self) -> int:
+        """Register this MCP instance. Returns session number (1-9)."""
+        self.workspace_name = self._get_workspace_name()
+        data = self._read_sessions()
+        data = self._cleanup_stale(data)
+
+        used = {info["number"] for info in data["sessions"].values()}
+        for n in range(1, 10):
+            if n not in used:
+                self.session_number = n
+                break
+        else:
+            self.session_number = len(data["sessions"]) + 1
+
+        self.session_id = f"s{self.session_number}_{self.pid}"
+        data["sessions"][self.session_id] = {
+            "number": self.session_number,
+            "workspace": self.workspace_name,
+            "pid": self.pid,
+            "started": time.time(),
+        }
+        self._write_sessions(data)
+        self._registered = True
+        return self.session_number
+
+    def deregister(self):
+        """Remove this session on exit."""
+        if not self._registered or not self.session_id:
+            return
+        try:
+            data = self._read_sessions()
+            data["sessions"].pop(self.session_id, None)
+            self._write_sessions(data)
+        except Exception:
+            pass
+        try:
+            resp = os.path.join(self.RESPONSES_DIR, f"{self.session_id}.json")
+            if os.path.exists(resp):
+                os.remove(resp)
+        except Exception:
+            pass
+        self.release_poll_lock()
+        self._registered = False
+
+    def get_active_sessions(self) -> List[Dict]:
+        data = self._read_sessions()
+        data = self._cleanup_stale(data)
+        self._write_sessions(data)
+        result = []
+        for sid, info in data["sessions"].items():
+            n = info["number"]
+            result.append({
+                "session_id": sid,
+                "number": n,
+                "workspace": info["workspace"],
+                "pid": info["pid"],
+                "icon": self.SESSION_ICONS[n - 1] if n <= len(self.SESSION_ICONS) else "🔷",
+            })
+        return sorted(result, key=lambda s: s["number"])
+
+    def session_id_by_number(self, number: int) -> Optional[str]:
+        for s in self.get_active_sessions():
+            if s["number"] == number:
+                return s["session_id"]
+        return None
+
+    # ── Formatting ──
+
+    def format_tag(self) -> str:
+        n = self.session_number or 0
+        icon = self.SESSION_ICONS[n - 1] if 0 < n <= len(self.SESSION_ICONS) else "🔷"
+        return f"{icon} #{n} · {self.workspace_name}"
+
+    def build_inline_keyboard(self) -> List[List[Dict]]:
+        sessions = self.get_active_sessions()
+        if len(sessions) <= 1:
+            return []
+        buttons: List[List[Dict]] = []
+        row: List[Dict] = []
+        for s in sessions:
+            row.append({
+                "text": f"{s['icon']} #{s['number']} {s['workspace']}",
+                "callback_data": f"ses:{s['session_id']}",
+            })
+            if len(row) >= 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        return buttons
+
+    # ── Shared Telegram offset ──
+
+    def get_shared_offset(self) -> int:
+        data = self._json_read(self.OFFSET_FILE)
+        return data.get("offset", 0) if isinstance(data, dict) else 0
+
+    def set_shared_offset(self, offset: int):
+        self._json_write(self.OFFSET_FILE, {"offset": offset})
+
+    def init_shared_offset_if_needed(self):
+        """Drain old Telegram updates so they don't interfere."""
+        if self.get_shared_offset() > 0:
+            return
+        try:
+            updates = _telegram_api_call("getUpdates", {"timeout": 0, "limit": 100}, timeout=10)
+            result = updates.get("result", [])
+            if result:
+                self.set_shared_offset(max(item.get("update_id", 0) for item in result))
+            else:
+                self.set_shared_offset(0)
+        except Exception:
+            self.set_shared_offset(0)
+
+    # ── Message map (message_id → session_id) ──
+
+    def record_message(self, message_id: int):
+        data = self._json_read(self.MESSAGE_MAP_FILE) or {}
+        data[str(message_id)] = self.session_id
+        if len(data) > 200:
+            items = sorted(data.items(), key=lambda x: int(x[0]))
+            data = dict(items[-200:])
+        self._json_write(self.MESSAGE_MAP_FILE, data)
+
+    def lookup_message(self, message_id: int) -> Optional[str]:
+        data = self._json_read(self.MESSAGE_MAP_FILE) or {}
+        return data.get(str(message_id))
+
+    # ── Response file I/O ──
+
+    def write_response(self, target_session_id: str, text: str):
+        path = os.path.join(self.RESPONSES_DIR, f"{target_session_id}.json")
+        self._json_write(path, {"text": text, "ts": time.time()})
+
+    def read_response(self) -> Optional[str]:
+        if not self.session_id:
+            return None
+        path = os.path.join(self.RESPONSES_DIR, f"{self.session_id}.json")
+        try:
+            if os.path.exists(path):
+                data = self._json_read(path)
+                os.remove(path)
+                return data.get("text") if isinstance(data, dict) else None
+        except Exception:
+            pass
+        return None
+
+    # ── Polling lock (only one instance polls Telegram) ──
+
+    def try_acquire_poll_lock(self) -> bool:
+        try:
+            self._lock_fd = open(self.POLL_LOCK_FILE, "w")
+            if IS_WINDOWS:
+                import msvcrt
+                msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._is_poller = True
+            return True
+        except Exception:
+            if self._lock_fd:
+                try:
+                    self._lock_fd.close()
+                except Exception:
+                    pass
+                self._lock_fd = None
+            self._is_poller = False
+            return False
+
+    def release_poll_lock(self):
+        if self._lock_fd:
+            try:
+                if IS_WINDOWS:
+                    import msvcrt
+                    msvcrt.locking(self._lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
+                self._lock_fd.close()
+            except Exception:
+                pass
+            self._lock_fd = None
+        self._is_poller = False
+
+    # ── Active context (tracks last button-tap session) ──
+
+    def set_active_context(self, session_id: str):
+        self._json_write(self.ACTIVE_CONTEXT_FILE, {"session_id": session_id, "ts": time.time()})
+
+    def get_and_clear_active_context(self) -> Optional[str]:
+        try:
+            if os.path.exists(self.ACTIVE_CONTEXT_FILE):
+                data = self._json_read(self.ACTIVE_CONTEXT_FILE)
+                os.remove(self.ACTIVE_CONTEXT_FILE)
+                if isinstance(data, dict) and time.time() - data.get("ts", 0) < 300:
+                    return data.get("session_id")
+        except Exception:
+            pass
+        return None
+
+
+# Global session coordinator — initialised in main()
+_session_coordinator: Optional[SessionCoordinator] = None
 
 def is_telegram_enabled() -> bool:
     """Check whether Telegram transport is configured via environment variables."""
@@ -101,10 +436,22 @@ def _send_and_wait_telegram_multiline_input(
     title: str,
     prompt: str,
     default_value: str = "",
-    timeout_seconds: int = 1800
+    timeout_seconds: int = 1800,
 ) -> Optional[str]:
-    """Send prompt to Telegram and wait for the next message from configured chat."""
-    global _telegram_last_update_id
+    """Send prompt to Telegram with session tagging and wait for a reply.
+
+    Supports multi-instance coordination:
+    - Only ONE instance polls Telegram at a time (file-lock).
+    - Other instances wait for a response file written by the poller.
+    - Incoming messages are routed by:
+        1. reply_to_message_id → message-map lookup
+        2. /r{n} command → session number
+        3. Active context (button tap) → last-tapped session
+        4. Single-session fallback
+        5. Ambiguous → disambiguation prompt
+    """
+    global _telegram_last_update_id, _session_coordinator
+    coord = _session_coordinator
 
     chat_id = os.getenv("HITL_TELEGRAM_CHAT_ID", "").strip()
     if not chat_id:
@@ -112,76 +459,195 @@ def _send_and_wait_telegram_multiline_input(
 
     _telegram_init_offset()
 
+    # ── Build tagged message ──
+    tag = coord.format_tag() if coord and coord.session_id else ""
+    header = f"🧠 {tag}" if tag else f"🧠 {title}"
     message_lines = [
-        f"🧠 {title}",
-        "",
-        prompt,
-        "",
-        f"{MULTILINE_DELINEATOR}",
-        "Reply to this message to continue."
+        header, "",
+        prompt, "",
+        MULTILINE_DELINEATOR,
+        "Reply to this message or tap a button below.",
     ]
     if default_value:
         message_lines.extend(["", "Default value:", default_value])
 
-    sent = _telegram_api_call(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "\n".join(message_lines)
-        },
-        timeout=20
-    )
+    # ── Send with inline keyboard ──
+    keyboard = coord.build_inline_keyboard() if coord else []
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": "\n".join(message_lines)}
+    if keyboard:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
 
+    sent = _telegram_api_call("sendMessage", payload, timeout=20)
     sent_message_id = sent.get("result", {}).get("message_id")
+
+    if coord and sent_message_id:
+        coord.record_message(sent_message_id)
+
+    # ── Init shared offset for poller ──
+    if coord:
+        coord.init_shared_offset_if_needed()
+
     start_time = time.time()
+    is_poller = coord.try_acquire_poll_lock() if coord else True
 
-    while True:
-        if time.time() - start_time > timeout_seconds:
-            return None
+    try:
+        while True:
+            if time.time() - start_time > timeout_seconds:
+                return None
 
-        with _telegram_lock:
-            offset = (_telegram_last_update_id or 0) + 1
+            # ────── POLLER PATH ──────
+            if is_poller or not coord:
+                if coord:
+                    offset = coord.get_shared_offset() + 1
+                else:
+                    with _telegram_lock:
+                        offset = (_telegram_last_update_id or 0) + 1
 
-        updates = _telegram_api_call(
-            "getUpdates",
-            {
-                "offset": offset,
-                "timeout": 25,
-                "allowed_updates": ["message", "edited_message"]
-            },
-            timeout=35
-        )
+                try:
+                    updates = _telegram_api_call(
+                        "getUpdates",
+                        {
+                            "offset": offset,
+                            "timeout": 25,
+                            "allowed_updates": ["message", "edited_message", "callback_query"],
+                        },
+                        timeout=35,
+                    )
+                except Exception:
+                    time.sleep(2)
+                    continue
 
-        result = updates.get("result", [])
-        if not result:
-            continue
+                for item in updates.get("result", []):
+                    update_id = item.get("update_id", 0)
+                    if coord:
+                        coord.set_shared_offset(update_id)
+                    else:
+                        with _telegram_lock:
+                            _telegram_last_update_id = max(_telegram_last_update_id or 0, update_id)
 
-        for item in result:
-            update_id = item.get("update_id", 0)
-            with _telegram_lock:
-                _telegram_last_update_id = max(_telegram_last_update_id or 0, update_id)
+                    # ── Callback query (inline-button tap) ──
+                    cb = item.get("callback_query")
+                    if cb:
+                        cb_data = cb.get("data", "")
+                        cb_id = cb.get("id")
+                        if cb_data.startswith("ses:") and coord:
+                            target_sid = cb_data[4:]
+                            coord.set_active_context(target_sid)
+                            sessions = coord.get_active_sessions()
+                            tgt = next((s for s in sessions if s["session_id"] == target_sid), None)
+                            ans = (
+                                f"📝 Now replying to #{tgt['number']} · {tgt['workspace']}. Send your message:"
+                                if tgt else "Send your message:"
+                            )
+                            try:
+                                _telegram_api_call("answerCallbackQuery", {
+                                    "callback_query_id": cb_id, "text": ans, "show_alert": False,
+                                }, timeout=10)
+                                _telegram_api_call("sendMessage", {"chat_id": chat_id, "text": ans}, timeout=10)
+                            except Exception:
+                                pass
+                        continue
 
-            msg = item.get("message") or item.get("edited_message")
-            if not msg:
-                continue
+                    # ── Text message ──
+                    msg = item.get("message") or item.get("edited_message")
+                    if not msg:
+                        continue
+                    if not _telegram_chat_id_matches(msg.get("chat", {}).get("id")):
+                        continue
+                    text = msg.get("text")
+                    if text is None:
+                        continue
 
-            chat = msg.get("chat", {})
-            if not _telegram_chat_id_matches(chat.get("id")):
-                continue
+                    # /sessions command
+                    if text.strip().lower() == "/sessions":
+                        sessions = coord.get_active_sessions() if coord else []
+                        if sessions:
+                            lines = ["📋 Active sessions:", ""]
+                            for s in sessions:
+                                lines.append(f"{s['icon']} #{s['number']} · {s['workspace']} (PID {s['pid']})")
+                            _telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "\n".join(lines)}, timeout=10)
+                        else:
+                            _telegram_api_call("sendMessage", {"chat_id": chat_id, "text": "No active sessions."}, timeout=10)
+                        continue
 
-            text = msg.get("text")
-            if text is None:
-                continue
+                    # /r{n} command
+                    rn_match = re.match(r"^/r(\d+)\s*(.*)", text, re.DOTALL)
+                    if rn_match and coord:
+                        target_num = int(rn_match.group(1))
+                        reply_body = rn_match.group(2).strip()
+                        target_sid = coord.session_id_by_number(target_num)
+                        if target_sid and reply_body:
+                            if target_sid == coord.session_id:
+                                return reply_body
+                            coord.write_response(target_sid, reply_body)
+                            continue
+                        elif target_sid and not reply_body:
+                            coord.set_active_context(target_sid)
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": f"📝 Now replying to #{target_num}. Send your message:",
+                            }, timeout=10)
+                            continue
+                        else:
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": f"⚠️ Session #{target_num} not found.",
+                            }, timeout=10)
+                            continue
 
-            reply_to = msg.get("reply_to_message", {})
-            reply_to_id = reply_to.get("message_id")
+                    # Route by reply_to_message_id
+                    reply_to_id = msg.get("reply_to_message", {}).get("message_id")
+                    if reply_to_id and coord:
+                        target_sid = coord.lookup_message(reply_to_id)
+                        if target_sid:
+                            if target_sid == coord.session_id:
+                                return text
+                            coord.write_response(target_sid, text)
+                            continue
 
-            if sent_message_id is not None and reply_to_id == sent_message_id:
-                return text
+                    # Route by active context (button tap)
+                    if coord:
+                        ctx_sid = coord.get_and_clear_active_context()
+                        if ctx_sid:
+                            if ctx_sid == coord.session_id:
+                                return text
+                            coord.write_response(ctx_sid, text)
+                            continue
 
-            # Fallback: accept any next text message in the configured chat
-            # in case user did not use Telegram's reply feature.
-            return text
+                    # Exact reply to THIS sent message
+                    if sent_message_id is not None and reply_to_id == sent_message_id:
+                        return text
+
+                    # Single session → accept directly
+                    sessions = coord.get_active_sessions() if coord else []
+                    if len(sessions) <= 1:
+                        return text
+
+                    # Multiple sessions, ambiguous → ask
+                    lines = ["Which session should I route this to?", ""]
+                    for s in sessions:
+                        lines.append(f"  /r{s['number']} — {s['icon']} {s['workspace']}")
+                    lines.append("\nOr tap a button below:")
+                    kb = coord.build_inline_keyboard()
+                    ask_payload: Dict[str, Any] = {"chat_id": chat_id, "text": "\n".join(lines)}
+                    if kb:
+                        ask_payload["reply_markup"] = json.dumps({"inline_keyboard": kb})
+                    _telegram_api_call("sendMessage", ask_payload, timeout=10)
+                    continue
+
+            # ────── NON-POLLER PATH ──────
+            else:
+                resp = coord.read_response() if coord else None
+                if resp is not None:
+                    return resp
+                # Try to become poller (in case the original poller exited)
+                if coord and coord.try_acquire_poll_lock():
+                    is_poller = True
+                    continue
+                time.sleep(0.4)
+    finally:
+        if coord and is_poller:
+            coord.release_poll_lock()
 
 def get_system_font():
     """Get appropriate system font for the current platform"""
@@ -1832,6 +2298,8 @@ async def health_check() -> Dict[str, Any]:
 # Main execution
 
 def main():
+    global _session_coordinator
+
     print("Starting Human-in-the-Loop MCP Server...")
     print("This server provides tools for LLMs to interact with humans through GUI dialogs.")
     print(f"Platform: {CURRENT_PLATFORM} ({platform.system()} {platform.release()})")
@@ -1846,6 +2314,17 @@ def main():
     print("health_check - Check server status")
     if is_telegram_enabled():
         print("Telegram transport: ENABLED (get_multiline_input will send+await via Telegram)")
+        # ── Session coordination ──
+        _session_coordinator = SessionCoordinator()
+        num = _session_coordinator.register()
+        atexit.register(_session_coordinator.deregister)
+        tag = _session_coordinator.format_tag()
+        print(f"Session registered: {tag} (PID {os.getpid()})")
+        sessions = _session_coordinator.get_active_sessions()
+        if len(sessions) > 1:
+            print(f"Active sessions: {len(sessions)}")
+            for s in sessions:
+                print(f"  {s['icon']} #{s['number']} · {s['workspace']} (PID {s['pid']})")
     else:
         print("Telegram transport: DISABLED (set HITL_TELEGRAM_BOT_TOKEN and HITL_TELEGRAM_CHAT_ID)")
     print("")
