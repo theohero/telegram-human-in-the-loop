@@ -142,24 +142,75 @@ You should see a version number. If you get an error, you may need to add `uv` t
 
 ---
 
-## Step 3: Download this server
+## Step 3: Install Git
 
-### Option A: Download as ZIP (easiest — no git needed)
-1. Go to **https://github.com/theohero/telegram-human-in-the-loop**
-2. Click the green **"< > Code"** button
-3. Click **"Download ZIP"**
-4. Extract the ZIP anywhere on your computer (e.g. `C:\Users\YourName\telegram-hitl\`)
-5. Remember the full path to `hitl_mcp_server.py` — you'll need it in Step 5
+Git is a tool for downloading code from GitHub. We'll use it to download this server.
 
-### Option B: Using git (if you have it)
+### Windows:
+1. Go to **https://git-scm.com/download/win**
+2. The download should start automatically — run the installer
+3. Click **"Next"** through all the screens — the default settings are fine
+4. On the "Adjusting your PATH" screen, make sure **"Git from the command line and also from 3rd-party software"** is selected (it should be by default)
+5. Click **"Install"**, then **"Finish"**
+6. **Close and re-open PowerShell**
+
+### macOS:
+Open **Terminal** and type:
 ```bash
-git clone https://github.com/theohero/telegram-human-in-the-loop.git
-cd telegram-human-in-the-loop
+git --version
 ```
+If git is not installed, macOS will prompt you to install the Command Line Tools — click **"Install"** and wait.
+
+Alternatively:
+```bash
+brew install git
+```
+
+### Linux (Ubuntu / Debian):
+```bash
+sudo apt update && sudo apt install git -y
+```
+
+### Verify git works:
+```bash
+git --version
+```
+You should see something like `git version 2.x.x`.
 
 ---
 
-## Step 4: Create your Telegram Bot
+## Step 4: Download this server
+
+### Option A: Using git (recommended)
+
+Open PowerShell (Windows) or Terminal (macOS/Linux) and run these commands one by one:
+
+```bash
+cd ~
+git clone https://github.com/theohero/telegram-human-in-the-loop.git
+```
+
+This creates a folder called `telegram-human-in-the-loop` in your **home directory** (user folder):
+- **Windows**: `C:\Users\YourName\telegram-human-in-the-loop\`
+- **macOS**: `/Users/YourName/telegram-human-in-the-loop/`
+- **Linux**: `/home/YourName/telegram-human-in-the-loop/`
+
+The path to the server file will be:
+- **Windows**: `C:\Users\YourName\telegram-human-in-the-loop\hitl_mcp_server.py`
+- **macOS/Linux**: `~/telegram-human-in-the-loop/hitl_mcp_server.py`
+
+> 💡 You'll need this path in Step 6.
+
+### Option B: Download as ZIP (if you don't want to use git)
+1. Go to **https://github.com/theohero/telegram-human-in-the-loop**
+2. Click the green **"< > Code"** button
+3. Click **"Download ZIP"**
+4. Extract the ZIP to your **home folder** (e.g. `C:\Users\YourName\`)
+5. The extracted folder will be called `telegram-human-in-the-loop-master` — you can rename it to `telegram-human-in-the-loop`
+
+---
+
+## Step 5: Create your Telegram Bot
 
 1. Open **Telegram** on your phone or computer
 2. Search for **@BotFather** (it has a blue checkmark ✅)
@@ -175,20 +226,37 @@ cd telegram-human-in-the-loop
 7. Now open a chat with your new bot — search for it by the username you just created
 8. **Send any message** to it (like "hello") — this is necessary to activate the chat
 
-9. Get your **Chat ID**:
-   - Open this URL in your browser (replace `YOUR_TOKEN` with your actual token):
-     ```
-     https://api.telegram.org/botYOUR_TOKEN/getUpdates
-     ```
-   - Look for `"chat":{"id":` followed by a number — that number is your **Chat ID**
-   - Example: `"chat":{"id":548411076` → your Chat ID is `548411076`
-   - **Copy this number and save it**
+### 🔑 Finding your Chat ID
+
+There are two ways to find your personal Telegram Chat ID:
+
+**Method 1: Telegram Web (easiest)**
+1. Open **https://web.telegram.org** in your browser
+2. Log in to your Telegram account
+3. Click on **Saved Messages** (or open any chat with yourself)
+4. Look at the **URL in your browser** — it will look like:
+   ```
+   https://web.telegram.org/k/#777000000
+   ```
+5. The **number at the end** is your Chat ID (e.g. `777000000`)
+6. **Copy this number and save it**
+
+**Method 2: Bot API**
+1. Open this URL in your browser (replace `YOUR_TOKEN` with your actual bot token from step 6):
+   ```
+   https://api.telegram.org/botYOUR_TOKEN/getUpdates
+   ```
+2. Look for `"chat":{"id":` followed by a number — that number is your **Chat ID**
+3. Example: `"chat":{"id":777000000` → your Chat ID is `777000000`
+4. **Copy this number and save it**
+
+> ⚠️ If Method 2 shows empty results, make sure you've sent a message to your bot first (step 8 above), then refresh the page.
 
 ---
 
-## Step 5: Configure your code editor
+## Step 6: Configure your code editor
 
-You need to tell your code editor where the server is and give it your Telegram credentials.
+You need to tell your code editor where the server is and give it your Telegram credentials. The MCP configuration file lives in your **user folder**, not in the project.
 
 ### VS Code (GitHub Copilot) — Most common setup
 
@@ -197,6 +265,7 @@ You need to tell your code editor where the server is and give it your Telegram 
 3. Type **"MCP: Open User Configuration"** and press Enter
 4. A JSON file will open. Paste this content (replace the 3 values marked with ⬅️):
 
+**Windows:**
 ```json
 {
   "servers": {
@@ -207,11 +276,35 @@ You need to tell your code editor where the server is and give it your Telegram 
         "--with", "fastmcp>=2.8.1",
         "--with", "pydantic>=2.0.0",
         "python",
-        "C:\\Users\\YourName\\telegram-hitl\\hitl_mcp_server.py"
+        "C:\\Users\\YourName\\telegram-human-in-the-loop\\hitl_mcp_server.py"
       ],
       "env": {
-        "HITL_TELEGRAM_BOT_TOKEN": "123456789:ABCdefGHI...",
-        "HITL_TELEGRAM_CHAT_ID": "548411076",
+        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE",
+        "HITL_TELEGRAM_TIMEOUT_SECONDS": "86400"
+      },
+      "type": "stdio"
+    }
+  }
+}
+```
+
+**macOS / Linux:**
+```json
+{
+  "servers": {
+    "hitl-mcp-server": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with", "fastmcp>=2.8.1",
+        "--with", "pydantic>=2.0.0",
+        "python",
+        "/Users/YourName/telegram-human-in-the-loop/hitl_mcp_server.py"
+      ],
+      "env": {
+        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE",
         "HITL_TELEGRAM_TIMEOUT_SECONDS": "86400"
       },
       "type": "stdio"
@@ -221,14 +314,14 @@ You need to tell your code editor where the server is and give it your Telegram 
 ```
 
 ⬅️ Replace these three things:
-- The **file path** on line 9 — the full path to where you saved `hitl_mcp_server.py`
-- The **bot token** on line 12 — from Step 4
-- The **chat ID** on line 13 — from Step 4
+- **`YourName`** — your actual computer username (the folder name under `C:\Users\`)
+- **`YOUR_BOT_TOKEN_HERE`** — the bot token from Step 5
+- **`YOUR_CHAT_ID_HERE`** — the Chat ID from Step 5
 
-> ⚠️ On Windows, use **double backslashes** `\\` in the file path (e.g. `C:\\Users\\...`)
-> On macOS/Linux, use forward slashes `/` (e.g. `/home/username/...`)
+> ⚠️ On **Windows**, use **double backslashes** `\\` in the file path
+> On **macOS/Linux**, use forward slashes `/`
 
-5. Save the file
+5. Save the file (`Ctrl + S`)
 
 ### Claude Desktop
 
@@ -246,11 +339,11 @@ File location:
         "--with", "fastmcp>=2.8.1",
         "--with", "pydantic>=2.0.0",
         "python",
-        "/path/to/hitl_mcp_server.py"
+        "/path/to/telegram-human-in-the-loop/hitl_mcp_server.py"
       ],
       "env": {
-        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_TOKEN",
-        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID"
+        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE"
       }
     }
   }
@@ -261,9 +354,9 @@ File location:
 
 ```bash
 claude mcp add hitl-mcp-server \
-  -e HITL_TELEGRAM_BOT_TOKEN=YOUR_TOKEN \
-  -e HITL_TELEGRAM_CHAT_ID=YOUR_CHAT_ID \
-  -- uv run --with "fastmcp>=2.8.1" --with "pydantic>=2.0.0" python /path/to/hitl_mcp_server.py
+  -e HITL_TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN_HERE \
+  -e HITL_TELEGRAM_CHAT_ID=YOUR_CHAT_ID_HERE \
+  -- uv run --with "fastmcp>=2.8.1" --with "pydantic>=2.0.0" python ~/telegram-human-in-the-loop/hitl_mcp_server.py
 ```
 
 ### Cursor / Windsurf / Cline
@@ -272,7 +365,7 @@ Same JSON structure as VS Code — just place it in the config file your editor 
 
 ---
 
-## Step 6: Test it!
+## Step 7: Test it!
 
 1. Open **VS Code**
 2. Open **Copilot Chat** (click the chat icon or press `Ctrl + Alt + I`)
@@ -299,6 +392,9 @@ Each person should create their own bot. The server only responds to the configu
 
 **Is my bot token safe?**
 The token stays in your local config file. It never gets uploaded anywhere. Never share your token publicly!
+
+**Where is the MCP config file stored?**
+The MCP configuration lives in your **user profile folder**, not in the project. For VS Code on Windows, it's `%APPDATA%\Code\User\mcp.json`. The server script (`.py` file) can be anywhere on your computer — you just point to it in the config.
 
 ---
 
@@ -383,24 +479,75 @@ uv --version
 
 ---
 
-## Шаг 3: Скачайте этот сервер
+## Шаг 3: Установите Git
 
-### Вариант А: Скачать как ZIP (самый простой — git не нужен)
-1. Перейдите на **https://github.com/theohero/telegram-human-in-the-loop**
-2. Нажмите зелёную кнопку **"< > Code"**
-3. Нажмите **"Download ZIP"**
-4. Распакуйте ZIP в любую папку (например, `C:\Users\ВашеИмя\telegram-hitl\`)
-5. Запомните полный путь к файлу `hitl_mcp_server.py` — он понадобится на Шаге 5
+Git — это программа для скачивания кода с GitHub. Мы используем её, чтобы скачать сервер.
 
-### Вариант Б: Через git (если он у вас есть)
+### Windows:
+1. Перейдите на **https://git-scm.com/download/win**
+2. Загрузка начнётся автоматически — запустите установщик
+3. Нажимайте **"Next"** на всех экранах — настройки по умолчанию подходят
+4. На экране "Adjusting your PATH" убедитесь, что выбрано **"Git from the command line and also from 3rd-party software"** (обычно уже выбрано)
+5. Нажмите **"Install"**, затем **"Finish"**
+6. **Закройте и откройте PowerShell заново**
+
+### macOS:
+Откройте **Терминал** и введите:
 ```bash
-git clone https://github.com/theohero/telegram-human-in-the-loop.git
-cd telegram-human-in-the-loop
+git --version
 ```
+Если git не установлен, macOS предложит установить Command Line Tools — нажмите **"Install"** и подождите.
+
+Или через brew:
+```bash
+brew install git
+```
+
+### Linux (Ubuntu / Debian):
+```bash
+sudo apt update && sudo apt install git -y
+```
+
+### Проверка:
+```bash
+git --version
+```
+Должно появиться `git version 2.x.x`.
 
 ---
 
-## Шаг 4: Создайте Telegram-бота
+## Шаг 4: Скачайте этот сервер
+
+### Вариант А: Через git (рекомендуется)
+
+Откройте PowerShell (Windows) или Терминал (macOS/Linux) и выполните эти команды по одной:
+
+```bash
+cd ~
+git clone https://github.com/theohero/telegram-human-in-the-loop.git
+```
+
+Это создаст папку `telegram-human-in-the-loop` в вашей **домашней директории** (папке пользователя):
+- **Windows**: `C:\Users\ВашеИмя\telegram-human-in-the-loop\`
+- **macOS**: `/Users/ВашеИмя/telegram-human-in-the-loop/`
+- **Linux**: `/home/ВашеИмя/telegram-human-in-the-loop/`
+
+Путь к файлу сервера:
+- **Windows**: `C:\Users\ВашеИмя\telegram-human-in-the-loop\hitl_mcp_server.py`
+- **macOS/Linux**: `~/telegram-human-in-the-loop/hitl_mcp_server.py`
+
+> 💡 Этот путь понадобится на Шаге 6.
+
+### Вариант Б: Скачать как ZIP (если не хотите использовать git)
+1. Перейдите на **https://github.com/theohero/telegram-human-in-the-loop**
+2. Нажмите зелёную кнопку **"< > Code"**
+3. Нажмите **"Download ZIP"**
+4. Распакуйте ZIP в вашу **домашнюю папку** (например, `C:\Users\ВашеИмя\`)
+5. Папка будет называться `telegram-human-in-the-loop-master` — можете переименовать в `telegram-human-in-the-loop`
+
+---
+
+## Шаг 5: Создайте Telegram-бота
 
 1. Откройте **Telegram** на телефоне или компьютере
 2. Найдите **@BotFather** (у него синяя галочка ✅)
@@ -416,20 +563,37 @@ cd telegram-human-in-the-loop
 7. Теперь откройте чат с вашим новым ботом — найдите его по username
 8. **Отправьте ему любое сообщение** (например, "привет") — это нужно для активации чата
 
-9. Узнайте свой **Chat ID**:
-   - Откройте эту ссылку в браузере (замените `ВАШ_ТОКЕН` на ваш настоящий токен):
-     ```
-     https://api.telegram.org/botВАШ_ТОКЕН/getUpdates
-     ```
-   - Найдите `"chat":{"id":` и число после него — это ваш **Chat ID**
-   - Пример: `"chat":{"id":548411076` → ваш Chat ID = `548411076`
-   - **Скопируйте это число и сохраните**
+### 🔑 Как узнать свой Chat ID
+
+Есть два способа узнать ваш персональный Chat ID в Telegram:
+
+**Способ 1: Через Telegram Web (самый простой)**
+1. Откройте **https://web.telegram.org** в браузере
+2. Войдите в свой аккаунт Telegram
+3. Нажмите на **Избранное (Saved Messages)** или откройте чат с самим собой
+4. Посмотрите на **URL в адресной строке браузера** — он будет выглядеть так:
+   ```
+   https://web.telegram.org/k/#777000000
+   ```
+5. **Число в конце** — это ваш Chat ID (например, `777000000`)
+6. **Скопируйте это число и сохраните**
+
+**Способ 2: Через Bot API**
+1. Откройте эту ссылку в браузере (замените `ВАШ_ТОКЕН` на настоящий токен бота из шага 6):
+   ```
+   https://api.telegram.org/botВАШ_ТОКЕН/getUpdates
+   ```
+2. Найдите `"chat":{"id":` и число после него — это ваш **Chat ID**
+3. Пример: `"chat":{"id":777000000` → ваш Chat ID = `777000000`
+4. **Скопируйте это число и сохраните**
+
+> ⚠️ Если Способ 2 показывает пустой результат, убедитесь, что вы отправили сообщение боту (шаг 8 выше), затем обновите страницу.
 
 ---
 
-## Шаг 5: Настройте ваш редактор кода
+## Шаг 6: Настройте ваш редактор кода
 
-Нужно сказать редактору, где находится сервер и дать ему ваши данные Telegram.
+Нужно сказать редактору, где находится сервер и дать ему ваши данные Telegram. Файл конфигурации MCP хранится в **папке вашего пользователя**, а не в проекте.
 
 ### VS Code (GitHub Copilot) — Самый популярный вариант
 
@@ -438,6 +602,7 @@ cd telegram-human-in-the-loop
 3. Введите **"MCP: Open User Configuration"** и нажмите Enter
 4. Откроется файл конфигурации. Вставьте это содержимое (замените 3 значения, отмеченные ⬅️):
 
+**Windows:**
 ```json
 {
   "servers": {
@@ -448,11 +613,35 @@ cd telegram-human-in-the-loop
         "--with", "fastmcp>=2.8.1",
         "--with", "pydantic>=2.0.0",
         "python",
-        "C:\\Users\\ВашеИмя\\telegram-hitl\\hitl_mcp_server.py"
+        "C:\\Users\\YourName\\telegram-human-in-the-loop\\hitl_mcp_server.py"
       ],
       "env": {
-        "HITL_TELEGRAM_BOT_TOKEN": "123456789:ABCdefGHI...",
-        "HITL_TELEGRAM_CHAT_ID": "548411076",
+        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE",
+        "HITL_TELEGRAM_TIMEOUT_SECONDS": "86400"
+      },
+      "type": "stdio"
+    }
+  }
+}
+```
+
+**macOS / Linux:**
+```json
+{
+  "servers": {
+    "hitl-mcp-server": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--with", "fastmcp>=2.8.1",
+        "--with", "pydantic>=2.0.0",
+        "python",
+        "/Users/YourName/telegram-human-in-the-loop/hitl_mcp_server.py"
+      ],
+      "env": {
+        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE",
         "HITL_TELEGRAM_TIMEOUT_SECONDS": "86400"
       },
       "type": "stdio"
@@ -462,14 +651,14 @@ cd telegram-human-in-the-loop
 ```
 
 ⬅️ Замените три вещи:
-- **Путь к файлу** в строке 9 — полный путь к `hitl_mcp_server.py` на вашем компьютере
-- **Токен бота** в строке 12 — из Шага 4
-- **Chat ID** в строке 13 — из Шага 4
+- **`YourName`** — ваше имя пользователя на компьютере (имя папки в `C:\Users\`)
+- **`YOUR_BOT_TOKEN_HERE`** — токен бота из Шага 5
+- **`YOUR_CHAT_ID_HERE`** — Chat ID из Шага 5
 
-> ⚠️ В Windows используйте **двойные обратные слеши** `\\` в пути (например, `C:\\Users\\...`)
-> В macOS/Linux используйте обычные слеши `/` (например, `/home/username/...`)
+> ⚠️ В **Windows** используйте **двойные обратные слеши** `\\` в пути
+> В **macOS/Linux** используйте обычные слеши `/`
 
-5. Сохраните файл
+5. Сохраните файл (`Ctrl + S`)
 
 ### Claude Desktop
 
@@ -487,11 +676,11 @@ cd telegram-human-in-the-loop
         "--with", "fastmcp>=2.8.1",
         "--with", "pydantic>=2.0.0",
         "python",
-        "/путь/к/hitl_mcp_server.py"
+        "/path/to/telegram-human-in-the-loop/hitl_mcp_server.py"
       ],
       "env": {
-        "HITL_TELEGRAM_BOT_TOKEN": "ВАШ_ТОКЕН",
-        "HITL_TELEGRAM_CHAT_ID": "ВАШ_CHAT_ID"
+        "HITL_TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "HITL_TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE"
       }
     }
   }
@@ -502,9 +691,9 @@ cd telegram-human-in-the-loop
 
 ```bash
 claude mcp add hitl-mcp-server \
-  -e HITL_TELEGRAM_BOT_TOKEN=ВАШ_ТОКЕН \
-  -e HITL_TELEGRAM_CHAT_ID=ВАШ_CHAT_ID \
-  -- uv run --with "fastmcp>=2.8.1" --with "pydantic>=2.0.0" python /путь/к/hitl_mcp_server.py
+  -e HITL_TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN_HERE \
+  -e HITL_TELEGRAM_CHAT_ID=YOUR_CHAT_ID_HERE \
+  -- uv run --with "fastmcp>=2.8.1" --with "pydantic>=2.0.0" python ~/telegram-human-in-the-loop/hitl_mcp_server.py
 ```
 
 ### Cursor / Windsurf / Cline
@@ -513,7 +702,7 @@ claude mcp add hitl-mcp-server \
 
 ---
 
-## Шаг 6: Проверьте, что всё работает!
+## Шаг 7: Проверьте, что всё работает!
 
 1. Откройте **VS Code**
 2. Откройте **Copilot Chat** (иконка чата или `Ctrl + Alt + I`)
@@ -540,6 +729,9 @@ claude mcp add hitl-mcp-server \
 
 **Мой токен бота в безопасности?**
 Токен хранится только в вашем локальном файле конфигурации. Он никуда не отправляется. Никогда не делитесь токеном публично!
+
+**Где хранится конфигурация MCP?**
+Конфигурация MCP хранится в **папке вашего профиля пользователя**, а не в проекте. Для VS Code на Windows это `%APPDATA%\Code\User\mcp.json`. Файл сервера (`.py`) может лежать где угодно — вы просто указываете путь к нему в конфигурации.
 
 ---
 
