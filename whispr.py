@@ -31,6 +31,52 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── Windows DLL fix (must run before any faster_whisper / ctranslate2 import) ──
+if sys.platform == "win32":
+    def _setup_cuda_dll_dirs() -> None:
+        """Add CUDA DLL directories to both os.add_dll_directory and PATH."""
+        import importlib.util
+        dirs: list[str] = []
+
+        for pkg in ("nvidia.cublas", "nvidia.cuda_runtime", "nvidia.cudnn"):
+            try:
+                spec = importlib.util.find_spec(pkg)
+                if spec and spec.submodule_search_locations:
+                    bin_dir = os.path.join(
+                        list(spec.submodule_search_locations)[0], "bin"
+                    )
+                    if os.path.isdir(bin_dir):
+                        dirs.append(bin_dir)
+            except Exception:
+                pass
+
+        torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+        if os.path.isdir(torch_lib):
+            dirs.append(torch_lib)
+
+        # Also check CUDA_PATH
+        cuda_path = os.environ.get("CUDA_PATH", "")
+        if cuda_path:
+            cuda_bin = os.path.join(cuda_path, "bin")
+            if os.path.isdir(cuda_bin):
+                dirs.append(cuda_bin)
+
+        # Apply both os.add_dll_directory (Python 3.8+) AND PATH fallback
+        current_path = os.environ.get("PATH", "")
+        for d in dirs:
+            try:
+                os.add_dll_directory(d)
+            except (OSError, AttributeError):
+                pass
+            if d not in current_path:
+                os.environ["PATH"] = d + os.pathsep + current_path
+                current_path = os.environ["PATH"]
+
+        if dirs:
+            logger.debug("Whispr: added %d CUDA DLL dirs: %s", len(dirs), dirs)
+
+    _setup_cuda_dll_dirs()
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".hitl-mcp")
@@ -154,14 +200,6 @@ class WhisprTranscriber:
         if self._model is not None:
             return
 
-        # DLL fix for Windows (same pattern as Oozr Dictation)
-        if sys.platform == "win32":
-            for d in _get_cuda_dll_dirs():
-                try:
-                    os.add_dll_directory(d)
-                except (OSError, AttributeError):
-                    pass
-
         from faster_whisper import WhisperModel  # noqa: WPS433
 
         model_name = self._cfg.model
@@ -258,28 +296,6 @@ def download_telegram_voice(file_id: str, bot_token: str) -> str:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
-
-
-def _get_cuda_dll_dirs() -> list[str]:
-    """Collect CUDA DLL directories for os.add_dll_directory on Windows."""
-    import importlib.util
-    dirs: list[str] = []
-
-    for pkg in ("nvidia.cublas", "nvidia.cuda_runtime", "nvidia.cudnn"):
-        try:
-            spec = importlib.util.find_spec(pkg)
-            if spec and spec.submodule_search_locations:
-                bin_dir = os.path.join(list(spec.submodule_search_locations)[0], "bin")
-                if os.path.isdir(bin_dir):
-                    dirs.append(bin_dir)
-        except Exception:
-            pass
-
-    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
-    if os.path.isdir(torch_lib):
-        dirs.append(torch_lib)
-
-    return dirs
 
 
 # ── Singleton transcriber ──────────────────────────────────────────────────
