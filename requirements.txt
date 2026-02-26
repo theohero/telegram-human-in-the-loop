@@ -1,2 +1,6 @@
 fastmcp>=2.8.1
 pydantic>=2.0.0
+
+# Optional: Whispr voice-message transcription (requires CUDA for GPU acceleration)
+# pip install faster-whisper
+# faster-whisper>=1.0.0

@@ -36,6 +36,25 @@ except Exception:
 
 from fastmcp import FastMCP, Context
 
+# Whispr — optional voice-message transcription
+try:
+    from whispr import (
+        is_available as whispr_is_available,
+        is_enabled as whispr_is_enabled,
+        get_config as whispr_get_config,
+        get_transcriber as whispr_get_transcriber,
+        download_telegram_voice as whispr_download_voice,
+    )
+    _WHISPR_IMPORTED = True
+except ImportError:
+    _WHISPR_IMPORTED = False
+
+    def whispr_is_available():
+        return False
+
+    def whispr_is_enabled():
+        return False
+
 # Platform detection
 CURRENT_PLATFORM = platform.system().lower()
 IS_WINDOWS = CURRENT_PLATFORM == 'windows'
@@ -432,6 +451,383 @@ def _telegram_init_offset() -> None:
         except Exception:
             _telegram_last_update_id = 0
 
+
+# ── Whispr: voice-message confirmation flow ────────────────────────────────
+
+def _whispr_handle_voice_message(msg: Dict[str, Any], chat_id: str) -> Optional[str]:
+    """Download, transcribe, and run confirmation loop for a voice message.
+
+    Returns the final approved text, or None if the user cancels.
+    This function blocks the current thread (called from the polling loop).
+    """
+    if not _WHISPR_IMPORTED or not whispr_is_enabled():
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": "🎙 Voice messages received but Whispr is not enabled.\n"
+                    "Enable it with /whispr on",
+        }, timeout=10)
+        return None
+
+    voice = msg.get("voice") or msg.get("audio")
+    if not voice:
+        return None
+
+    file_id = voice.get("file_id")
+    duration = voice.get("duration", 0)
+    if not file_id:
+        return None
+
+    bot_token = os.getenv("HITL_TELEGRAM_BOT_TOKEN", "").strip()
+
+    # Notify user we're processing
+    _telegram_api_call("sendMessage", {
+        "chat_id": chat_id,
+        "text": f"🎙 Transcribing voice message ({duration}s)…",
+    }, timeout=10)
+
+    # Download and transcribe
+    try:
+        audio_path = whispr_download_voice(file_id, bot_token)
+        try:
+            transcriber = whispr_get_transcriber()
+            transcribed_text = transcriber.transcribe(audio_path)
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
+    except Exception as exc:
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"❌ Whispr transcription failed: {exc}",
+        }, timeout=10)
+        return None
+
+    if not transcribed_text.strip():
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": "🎙 Transcription was empty — no speech detected.",
+        }, timeout=10)
+        return None
+
+    # ── Confirmation loop ──
+    current_text = transcribed_text.strip()
+    original_text = current_text
+    edit_history: list[str] = []
+
+    while True:
+        # Send confirmation message with buttons
+        confirm_msg = (
+            f"🎙 **Transcribed text:**\n\n"
+            f"{current_text}\n\n"
+            f"─────────────────────\n"
+            f"Is this correct?"
+        )
+        keyboard = [
+            [
+                {"text": "✅ Yes, proceed", "callback_data": "whispr:approve"},
+                {"text": "✏️ Edit", "callback_data": "whispr:edit"},
+            ],
+            [
+                {"text": "❌ Cancel", "callback_data": "whispr:cancel"},
+            ],
+        ]
+        confirm_payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": confirm_msg,
+            "parse_mode": "Markdown",
+            "reply_markup": json.dumps({"inline_keyboard": keyboard}),
+        }
+        try:
+            _telegram_api_call("sendMessage", confirm_payload, timeout=15)
+        except Exception:
+            # Markdown might fail if text has special chars, retry without parse_mode
+            confirm_payload.pop("parse_mode", None)
+            confirm_payload["text"] = (
+                f"🎙 Transcribed text:\n\n"
+                f"{current_text}\n\n"
+                f"─────────────────────\n"
+                f"Is this correct?"
+            )
+            _telegram_api_call("sendMessage", confirm_payload, timeout=15)
+
+        # Wait for user response (button tap or text message)
+        response = _whispr_wait_for_response(chat_id)
+        if response is None:
+            return None  # timeout
+
+        if response == "__WHISPR_APPROVE__":
+            # User approved — return the text
+            # Send confirmation
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": "✅ Transcription approved. Sending to agent…",
+            }, timeout=10)
+            return json.dumps({
+                "__whispr__": True,
+                "text": current_text,
+                "original": original_text,
+                "edits": edit_history,
+            })
+
+        elif response == "__WHISPR_CANCEL__":
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": "❌ Voice message cancelled.",
+            }, timeout=10)
+            return None
+
+        elif response == "__WHISPR_EDIT__":
+            # Ask for corrections
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    "✏️ Send your corrections:\n\n"
+                    "• Type the full corrected text, OR\n"
+                    "• Describe what to change (e.g. \"change 'debug thing' to 'debugging step'\")"
+                ),
+            }, timeout=10)
+            # Wait for the correction text
+            correction = _whispr_wait_for_response(chat_id)
+            if correction is None:
+                return None
+            if correction.startswith("__WHISPR_"):
+                continue  # they tapped a button instead of typing, re-show
+
+            edit_history.append(correction)
+
+            # If the correction is long enough to be a full replacement, use it directly
+            if len(correction) > len(current_text) * 0.5:
+                current_text = correction.strip()
+            else:
+                # Short correction — treat as natural language edit instruction
+                # We can't run LLM here, so append the correction as a note
+                # and the agent will interpret it
+                current_text = f"{current_text}\n\n[User correction: {correction}]"
+
+            # Loop back to confirmation
+            continue
+
+        else:
+            # User sent raw text without pressing a button — treat as correction
+            edit_history.append(response)
+            current_text = response.strip()
+            # Loop back to confirmation
+            continue
+
+
+def _whispr_wait_for_response(chat_id: str, timeout_seconds: int = 300) -> Optional[str]:
+    """Wait for a user response (callback or text) in the Whispr flow.
+
+    Returns:
+        - "__WHISPR_APPROVE__" if user tapped ✅
+        - "__WHISPR_EDIT__" if user tapped ✏️
+        - "__WHISPR_CANCEL__" if user tapped ❌
+        - The text content if user sent a text message
+        - None on timeout
+    """
+    global _telegram_last_update_id
+    start = time.time()
+
+    while time.time() - start < timeout_seconds:
+        try:
+            with _telegram_lock:
+                offset = (_telegram_last_update_id or 0) + 1
+            updates = _telegram_api_call(
+                "getUpdates",
+                {"offset": offset, "timeout": 15, "allowed_updates": ["message", "callback_query"]},
+                timeout=25,
+            )
+        except Exception:
+            time.sleep(1)
+            continue
+
+        for item in updates.get("result", []):
+            update_id = item.get("update_id", 0)
+            with _telegram_lock:
+                _telegram_last_update_id = max(_telegram_last_update_id or 0, update_id)
+
+            # Check callback queries (button taps)
+            cb = item.get("callback_query")
+            if cb:
+                cb_data = cb.get("data", "")
+                cb_id = cb.get("id")
+                if cb_data == "whispr:approve":
+                    try:
+                        _telegram_api_call("answerCallbackQuery", {
+                            "callback_query_id": cb_id, "text": "✅ Approved!", "show_alert": False,
+                        }, timeout=10)
+                    except Exception:
+                        pass
+                    return "__WHISPR_APPROVE__"
+                elif cb_data == "whispr:edit":
+                    try:
+                        _telegram_api_call("answerCallbackQuery", {
+                            "callback_query_id": cb_id, "text": "✏️ Send your corrections", "show_alert": False,
+                        }, timeout=10)
+                    except Exception:
+                        pass
+                    return "__WHISPR_EDIT__"
+                elif cb_data == "whispr:cancel":
+                    try:
+                        _telegram_api_call("answerCallbackQuery", {
+                            "callback_query_id": cb_id, "text": "❌ Cancelled", "show_alert": False,
+                        }, timeout=10)
+                    except Exception:
+                        pass
+                    return "__WHISPR_CANCEL__"
+                # Other callback (session switching etc.) — ignore in whispr flow
+                continue
+
+            # Check text messages
+            msg = item.get("message")
+            if msg and _telegram_chat_id_matches(msg.get("chat", {}).get("id")):
+                text = msg.get("text")
+                if text:
+                    return text
+
+    return None  # timeout
+
+
+# ── Whispr command handlers ────────────────────────────────────────────────
+
+def _handle_whispr_command(text: str, chat_id: str) -> None:
+    """Handle /whispr commands (on, off, status, model)."""
+    parts = text.split(maxsplit=1)
+    subcmd = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+    if not _WHISPR_IMPORTED:
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                "🎙 **Whispr module not found.**\n\n"
+                "Install faster-whisper to enable voice transcription:\n"
+                "`pip install faster-whisper`"
+            ),
+            "parse_mode": "Markdown",
+        }, timeout=10)
+        return
+
+    cfg = whispr_get_config()
+
+    if subcmd in ("on", "enable"):
+        if not whispr_is_available():
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    "⚠️ faster-whisper is not installed.\n"
+                    "Run: `pip install faster-whisper`\n"
+                    "Then restart the MCP server."
+                ),
+                "parse_mode": "Markdown",
+            }, timeout=10)
+            return
+        cfg.enabled = True
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                f"✅ Whispr enabled!\n\n"
+                f"Model: {cfg.model}\n"
+                f"Language: {cfg.language or 'auto-detect'}\n\n"
+                f"Send a voice message to try it out."
+            ),
+        }, timeout=10)
+
+    elif subcmd in ("off", "disable"):
+        cfg.enabled = False
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": "🔇 Whispr disabled. Voice messages will be ignored.",
+        }, timeout=10)
+
+    elif subcmd.startswith("model"):
+        model_parts = subcmd.split(maxsplit=1)
+        if len(model_parts) > 1:
+            new_model = model_parts[1].strip()
+            cfg.model = new_model
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": f"✅ Whispr model set to: {new_model}\n(Will load on next transcription)",
+            }, timeout=10)
+        else:
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    f"Current model: {cfg.model}\n\n"
+                    "Available: tiny, base, small, medium, large-v3\n"
+                    "Usage: /whispr model small"
+                ),
+            }, timeout=10)
+
+    elif subcmd.startswith("lang"):
+        lang_parts = subcmd.split(maxsplit=1)
+        if len(lang_parts) > 1:
+            new_lang = lang_parts[1].strip()
+            if new_lang == "auto":
+                new_lang = ""
+            cfg.language = new_lang
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": f"✅ Whispr language set to: {new_lang or 'auto-detect'}",
+            }, timeout=10)
+        else:
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    f"Current language: {cfg.language or 'auto-detect'}\n\n"
+                    "Usage: /whispr lang en  (or ru, de, fr, auto)"
+                ),
+            }, timeout=10)
+
+    else:
+        # Status
+        available = whispr_is_available()
+        enabled = cfg.enabled
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                f"🎙 **Whispr Status**\n\n"
+                f"Available: {'✅ Yes' if available else '❌ No (install faster-whisper)'}\n"
+                f"Enabled: {'✅ On' if enabled else '🔇 Off'}\n"
+                f"Model: {cfg.model}\n"
+                f"Language: {cfg.language or 'auto-detect'}\n\n"
+                f"Commands:\n"
+                f"/whispr on — Enable transcription\n"
+                f"/whispr off — Disable transcription\n"
+                f"/whispr model <name> — Change model\n"
+                f"/whispr lang <code> — Set language"
+            ),
+            "parse_mode": "Markdown",
+        }, timeout=10)
+
+
+def _handle_help_command(chat_id: str) -> None:
+    """Handle /help command with full command list including Whispr."""
+    whispr_status = ""
+    if _WHISPR_IMPORTED:
+        cfg = whispr_get_config()
+        status = "✅ ON" if cfg.enabled else "🔇 OFF"
+        whispr_status = f"\n\n🎙 **Whispr** (voice transcription): {status}"
+
+    _telegram_api_call("sendMessage", {
+        "chat_id": chat_id,
+        "text": (
+            "🤖 **HITL MCP Server — Commands**\n\n"
+            "📋 /sessions — List active agent sessions\n"
+            "📝 /r{n} — Reply to session #n\n"
+            f"🎙 /whispr — Voice transcription settings\n"
+            f"  /whispr on — Enable Whispr\n"
+            f"  /whispr off — Disable Whispr\n"
+            f"  /whispr model <name> — Set model (tiny/base/small/medium/large-v3)\n"
+            f"  /whispr lang <code> — Set language (en/ru/auto)\n"
+            "❓ /help — Show this help"
+            f"{whispr_status}"
+        ),
+        "parse_mode": "Markdown",
+    }, timeout=10)
+
+
 def _send_and_wait_telegram_multiline_input(
     title: str,
     prompt: str,
@@ -554,8 +950,36 @@ def _send_and_wait_telegram_multiline_input(
                         continue
                     if not _telegram_chat_id_matches(msg.get("chat", {}).get("id")):
                         continue
-                    text = msg.get("text")
-                    if text is None:
+
+                    # ── Voice message (Whispr) ──
+                    if msg.get("voice") or msg.get("audio"):
+                        if whispr_is_enabled():
+                            whispr_result = _whispr_handle_voice_message(msg, chat_id)
+                            if whispr_result is not None:
+                                # Route the transcribed text like a normal message
+                                text = whispr_result
+                                # Fall through to normal routing below
+                            else:
+                                continue  # cancelled or failed
+                        else:
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": "🎙 Voice message received. Enable Whispr to auto-transcribe: /whispr on",
+                            }, timeout=10)
+                            continue
+                    else:
+                        text = msg.get("text")
+                        if text is None:
+                            continue
+
+                    # /whispr command
+                    if text.strip().lower().startswith("/whispr"):
+                        _handle_whispr_command(text.strip(), chat_id)
+                        continue
+
+                    # /help command (updated with Whispr info)
+                    if text.strip().lower() == "/help":
+                        _handle_help_command(chat_id)
                         continue
 
                     # /sessions command
@@ -1964,15 +2388,40 @@ async def get_multiline_input(
                 if result is not None:
                     if ctx:
                         await ctx.info(f"Received multiline input from Telegram ({len(result)} characters)")
-                    return {
+
+                    # ── Whispr: detect transcribed voice message ──
+                    whispr_meta = None
+                    user_text = result
+                    try:
+                        parsed = json.loads(result)
+                        if isinstance(parsed, dict) and parsed.get("__whispr__"):
+                            user_text = parsed.get("text", result)
+                            whispr_meta = {
+                                "whispr": True,
+                                "original_transcription": parsed.get("original", ""),
+                                "edits": parsed.get("edits", []),
+                            }
+                            if ctx:
+                                edits = len(parsed.get("edits", []))
+                                await ctx.info(
+                                    f"Voice message transcribed via Whispr"
+                                    + (f" ({edits} edit(s) applied)" if edits else "")
+                                )
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    response = {
                         "success": True,
-                        "user_input": result,
-                        "character_count": len(result),
-                        "line_count": len(result.split('\n')),
+                        "user_input": user_text,
+                        "character_count": len(user_text),
+                        "line_count": len(user_text.split('\n')),
                         "cancelled": False,
                         "platform": CURRENT_PLATFORM,
-                        "transport": "telegram"
+                        "transport": "telegram",
                     }
+                    if whispr_meta:
+                        response.update(whispr_meta)
+                    return response
 
                 if ctx:
                     await ctx.warning("Telegram input timed out or was not received")
@@ -2243,10 +2692,93 @@ OPTIMIZE FOR USER EXPERIENCE:
 4. **Communication:**
    - Explain why you need user input
    - Show progress and intermediate results
-   - Confirm successful completion of user-guided actions"""
+   - Confirm successful completion of user-guided actions""",
+
+        "whispr_voice_input": """
+**WHISPR — VOICE MESSAGE TRANSCRIPTION:**
+
+When Whispr is enabled and the user sends a voice or audio message in
+Telegram instead of typing, the server automatically:
+
+1. Downloads the voice note.
+2. Transcribes it with faster-whisper (local, private, CUDA-accelerated).
+3. Sends the user a confirmation message with buttons:
+   ✅ Yes, proceed  |  ✏️ Edit  |  ❌ Cancel
+4. If the user chooses Edit, they can type corrections and re-confirm.
+5. Once approved, the final text is returned to you as `user_input`.
+
+**How to detect a Whispr response:**
+The return dict will contain `"whispr": True` plus:
+- `original_transcription` — the raw model output
+- `edits` — list of correction messages the user typed (may be empty)
+
+If `edits` is non-empty, the user reworded something after the initial
+transcription.  Treat `user_input` as the authoritative final text.
+
+**MCP tools for Whispr:**
+- `toggle_whispr(enabled, model?, language?)` — turn it on/off, set model or language.
+- `health_check()` → includes `whispr.available`, `whispr.enabled`, `whispr.model`.
+
+**Telegram commands the user can type:**
+`/whispr on|off|status|model <size>|lang <code>`
+"""
     }
     
     return guidance
+
+# ── Whispr: MCP tool to toggle voice transcription ──
+@mcp.tool()
+async def toggle_whispr(
+    enabled: bool,
+    model: str = "",
+    language: str = "",
+    ctx: Context | None = None,
+) -> Dict[str, Any]:
+    """Enable or disable Whispr voice-message transcription in Telegram.
+
+    When enabled, voice/audio messages from the user are automatically
+    transcribed and sent through a confirmation flow before returning to
+    the agent.
+
+    Args:
+        enabled:  True to enable, False to disable Whispr.
+        model:    (optional) Whisper model size – tiny, base, small, medium, large-v3.
+        language: (optional) ISO-639-1 language code (e.g. 'en', 'ru'). Empty = auto-detect.
+    """
+    if not _WHISPR_IMPORTED:
+        return {
+            "success": False,
+            "error": "Whispr is not available – faster-whisper is not installed. "
+                     "Install it with: pip install faster-whisper",
+            "whispr_available": False,
+        }
+
+    cfg = whispr_get_config()
+    cfg.enabled = enabled
+    if model:
+        cfg.model_size = model
+    if language:
+        cfg.language = language
+    cfg.save()
+
+    status_msg = f"Whispr {'enabled' if enabled else 'disabled'}"
+    if model:
+        status_msg += f" (model: {model})"
+    if language:
+        status_msg += f" (language: {language})"
+
+    if ctx:
+        await ctx.info(status_msg)
+
+    return {
+        "success": True,
+        "whispr_available": True,
+        "whispr_enabled": cfg.enabled,
+        "whispr_model": cfg.model_size,
+        "whispr_language": cfg.language or "auto-detect",
+        "message": status_msg,
+    }
+
 
 # Add a health check tool
 @mcp.tool()
@@ -2255,6 +2787,16 @@ async def health_check() -> Dict[str, Any]:
     try:
         gui_available = ensure_gui_initialized()
         telegram_enabled = is_telegram_enabled()
+
+        # ── Whispr status ──
+        whispr_info = {"available": False, "enabled": False}
+        if _WHISPR_IMPORTED:
+            whispr_info["available"] = whispr_is_available()
+            whispr_info["enabled"] = whispr_is_enabled()
+            if whispr_info["available"]:
+                cfg = whispr_get_config()
+                whispr_info["model"] = cfg.model_size
+                whispr_info["language"] = cfg.language or "auto-detect"
         
         return {
             "status": "healthy" if gui_available else "degraded",
@@ -2265,6 +2807,7 @@ async def health_check() -> Dict[str, Any]:
                 "has_chat_id": bool(os.getenv("HITL_TELEGRAM_CHAT_ID")),
                 "chat_id": os.getenv("HITL_TELEGRAM_CHAT_ID", "")
             },
+            "whispr": whispr_info,
             "server_name": "Human-in-the-Loop Server",
             "platform": CURRENT_PLATFORM,
             "platform_details": {
@@ -2284,7 +2827,8 @@ async def health_check() -> Dict[str, Any]:
                 "get_multiline_input",
                 "show_confirmation_dialog",
                 "show_info_message",
-                "get_human_loop_prompt"
+                "get_human_loop_prompt",
+                "toggle_whispr"
             ]
         }
     except Exception as e:
@@ -2312,6 +2856,7 @@ def main():
     print("show_info_message - Display information to user")
     print("get_human_loop_prompt - Get guidance on when to use human-in-the-loop tools")
     print("health_check - Check server status")
+    print("toggle_whispr - Enable/disable voice transcription (Whispr)")
     if is_telegram_enabled():
         print("Telegram transport: ENABLED (get_multiline_input will send+await via Telegram)")
         # ── Session coordination ──
@@ -2327,6 +2872,17 @@ def main():
                 print(f"  {s['icon']} #{s['number']} · {s['workspace']} (PID {s['pid']})")
     else:
         print("Telegram transport: DISABLED (set HITL_TELEGRAM_BOT_TOKEN and HITL_TELEGRAM_CHAT_ID)")
+
+    # ── Whispr status ──
+    if _WHISPR_IMPORTED and whispr_is_available():
+        cfg = whispr_get_config()
+        state = "ENABLED" if cfg.enabled else "DISABLED"
+        lang  = cfg.language or "auto"
+        print(f"Whispr voice transcription: {state} (model: {cfg.model_size}, lang: {lang})")
+        print("  Toggle in Telegram: /whispr on | /whispr off")
+    else:
+        print("Whispr voice transcription: NOT AVAILABLE (install faster-whisper to enable)")
+
     print("")
     
     # Platform-specific startup messages
