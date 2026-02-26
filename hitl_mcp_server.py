@@ -2756,7 +2756,7 @@ async def toggle_whispr(
     cfg = whispr_get_config()
     cfg.enabled = enabled
     if model:
-        cfg.model_size = model
+        cfg.model = model
     if language:
         cfg.language = language
     cfg.save()
@@ -2774,7 +2774,7 @@ async def toggle_whispr(
         "success": True,
         "whispr_available": True,
         "whispr_enabled": cfg.enabled,
-        "whispr_model": cfg.model_size,
+        "whispr_model": cfg.model,
         "whispr_language": cfg.language or "auto-detect",
         "message": status_msg,
     }
@@ -2795,7 +2795,7 @@ async def health_check() -> Dict[str, Any]:
             whispr_info["enabled"] = whispr_is_enabled()
             if whispr_info["available"]:
                 cfg = whispr_get_config()
-                whispr_info["model"] = cfg.model_size
+                whispr_info["model"] = cfg.model
                 whispr_info["language"] = cfg.language or "auto-detect"
         
         return {
@@ -2878,7 +2878,7 @@ def main():
         cfg = whispr_get_config()
         state = "ENABLED" if cfg.enabled else "DISABLED"
         lang  = cfg.language or "auto"
-        print(f"Whispr voice transcription: {state} (model: {cfg.model_size}, lang: {lang})")
+        print(f"Whispr voice transcription: {state} (model: {cfg.model}, lang: {lang})")
         print("  Toggle in Telegram: /whispr on | /whispr off")
     else:
         print("Whispr voice transcription: NOT AVAILABLE (install faster-whisper to enable)")
