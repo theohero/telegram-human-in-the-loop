@@ -31,6 +31,10 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# Keep os.add_dll_directory handles alive for process lifetime.
+# If handles are garbage-collected, Windows can drop those DLL search paths.
+_DLL_DIR_HANDLES: list[Any] = []
+
 # ── Windows DLL fix (must run before any faster_whisper / ctranslate2 import) ──
 if sys.platform == "win32":
     def _setup_cuda_dll_dirs() -> None:
@@ -65,7 +69,8 @@ if sys.platform == "win32":
         current_path = os.environ.get("PATH", "")
         for d in dirs:
             try:
-                os.add_dll_directory(d)
+                handle = os.add_dll_directory(d)
+                _DLL_DIR_HANDLES.append(handle)
             except (OSError, AttributeError):
                 pass
             if d not in current_path:
