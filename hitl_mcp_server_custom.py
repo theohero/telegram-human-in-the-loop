@@ -2462,7 +2462,7 @@ async def get_multiline_input(
     prompt: Annotated[str, Field(description="The prompt/question to show to the user")],
     default_value: Annotated[str, Field(description="Default text to pre-fill in the text area")] = "",
     ctx: Context = None
-) -> Dict[str, Any]:
+) -> Any:
     """
     Create a multi-line text input dialog for the user to enter longer text content.
     
