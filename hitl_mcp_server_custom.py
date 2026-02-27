@@ -22,6 +22,7 @@ import atexit
 import re
 import urllib.request
 import urllib.error
+import base64
 from pydantic import Field
 from typing import Annotated
 # Set required environment variable for FastMCP 2.8.1+
@@ -35,6 +36,8 @@ except Exception:
     pass
 
 from fastmcp import FastMCP, Context
+from fastmcp.utilities.types import Image as FastMCPImage
+from mcp.types import ImageContent, TextContent
 
 # Whispr — optional voice-message transcription
 try:
@@ -456,6 +459,35 @@ def _telegram_init_offset() -> None:
             _telegram_last_update_id = 0
 
 
+# ── Telegram Photo Download ─────────────────────────────────────────────────
+
+def _telegram_download_photo(file_id: str) -> tuple:
+    """Download a photo from Telegram by file_id.
+
+    Returns (image_bytes, mime_type).
+    """
+    token = os.getenv("HITL_TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("HITL_TELEGRAM_BOT_TOKEN is not set")
+    # Step 1: getFile to obtain the file_path on Telegram's server
+    result = _telegram_api_call("getFile", {"file_id": file_id})
+    file_path = result["result"]["file_path"]  # e.g. "photos/file_123.jpg"
+    # Step 2: Download the actual file bytes
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = resp.read()
+    # Determine MIME type from file extension
+    ext = os.path.splitext(file_path)[1].lower()
+    mime_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".gif": "image/gif",
+        ".webp": "image/webp", ".bmp": "image/bmp",
+    }
+    mime_type = mime_map.get(ext, "image/jpeg")
+    return data, mime_type
+
+
 # ── Whispr: voice-message confirmation flow ────────────────────────────────
 
 def _whispr_handle_voice_message(msg: Dict[str, Any], chat_id: str) -> Optional[str]:
@@ -825,6 +857,7 @@ def _handle_help_command(chat_id: str) -> None:
             f"  /whispr off — Disable Whispr\n"
             f"  /whispr model <name> — Set model (tiny/base/small/medium/large-v3)\n"
             f"  /whispr lang <code> — Set language (en/ru/auto)\n"
+            "📷 **Images** — Send a photo or image file and it will be forwarded to the AI model\n"
             "❓ /help — Show this help"
             f"{whispr_status}"
         ),
@@ -971,6 +1004,76 @@ def _send_and_wait_telegram_multiline_input(
                                 "text": "🎙 Voice message received. Enable Whispr to auto-transcribe: /whispr on",
                             }, timeout=10)
                             continue
+
+                    # ── Photo message ──
+                    elif msg.get("photo"):
+                        try:
+                            # Telegram sends array of PhotoSize; last = largest
+                            photo_sizes = msg["photo"]
+                            best_photo = photo_sizes[-1]
+                            file_id = best_photo["file_id"]
+                            caption = msg.get("caption", "")
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": "📷 Photo received, downloading...",
+                            }, timeout=10)
+                            image_bytes, mime_type = _telegram_download_photo(file_id)
+                            image_b64 = base64.b64encode(image_bytes).decode("ascii")
+                            # Encode as JSON payload so get_multiline_input can detect it
+                            text = json.dumps({
+                                "__image__": True,
+                                "caption": caption,
+                                "mime_type": mime_type,
+                                "image_b64": image_b64,
+                                "file_size": len(image_bytes),
+                                "width": best_photo.get("width"),
+                                "height": best_photo.get("height"),
+                            })
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": f"✅ Photo downloaded ({len(image_bytes)} bytes, {best_photo.get('width')}x{best_photo.get('height')}). Forwarding to model...",
+                            }, timeout=10)
+                            # Fall through to normal routing below
+                        except Exception as photo_err:
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": f"❌ Failed to download photo: {photo_err}",
+                            }, timeout=10)
+                            continue
+
+                    # ── Document (file) with image MIME ──
+                    elif msg.get("document") and (msg["document"].get("mime_type", "")).startswith("image/"):
+                        try:
+                            doc = msg["document"]
+                            file_id = doc["file_id"]
+                            caption = msg.get("caption", "")
+                            mime_type = doc.get("mime_type", "image/jpeg")
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": "📷 Image file received, downloading...",
+                            }, timeout=10)
+                            image_bytes, _ = _telegram_download_photo(file_id)
+                            image_b64 = base64.b64encode(image_bytes).decode("ascii")
+                            text = json.dumps({
+                                "__image__": True,
+                                "caption": caption,
+                                "mime_type": mime_type,
+                                "image_b64": image_b64,
+                                "file_size": len(image_bytes),
+                                "width": None,
+                                "height": None,
+                            })
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": f"✅ Image downloaded ({len(image_bytes)} bytes). Forwarding to model...",
+                            }, timeout=10)
+                        except Exception as doc_err:
+                            _telegram_api_call("sendMessage", {
+                                "chat_id": chat_id,
+                                "text": f"❌ Failed to download image: {doc_err}",
+                            }, timeout=10)
+                            continue
+
                     else:
                         text = msg.get("text")
                         if text is None:
@@ -2393,26 +2496,66 @@ async def get_multiline_input(
                     if ctx:
                         await ctx.info(f"Received multiline input from Telegram ({len(result)} characters)")
 
-                    # ── Whispr: detect transcribed voice message ──
+                    # ── Detect special message types ──
                     whispr_meta = None
+                    image_payload = None
                     user_text = result
                     try:
                         parsed = json.loads(result)
-                        if isinstance(parsed, dict) and parsed.get("__whispr__"):
-                            user_text = parsed.get("text", result)
-                            whispr_meta = {
-                                "whispr": True,
-                                "original_transcription": parsed.get("original", ""),
-                                "edits": parsed.get("edits", []),
-                            }
-                            if ctx:
-                                edits = len(parsed.get("edits", []))
-                                await ctx.info(
-                                    f"Voice message transcribed via Whispr"
-                                    + (f" ({edits} edit(s) applied)" if edits else "")
-                                )
+                        if isinstance(parsed, dict):
+                            # ── Whispr voice message ──
+                            if parsed.get("__whispr__"):
+                                user_text = parsed.get("text", result)
+                                whispr_meta = {
+                                    "whispr": True,
+                                    "original_transcription": parsed.get("original", ""),
+                                    "edits": parsed.get("edits", []),
+                                }
+                                if ctx:
+                                    edits = len(parsed.get("edits", []))
+                                    await ctx.info(
+                                        f"Voice message transcribed via Whispr"
+                                        + (f" ({edits} edit(s) applied)" if edits else "")
+                                    )
+                            # ── Image message ──
+                            elif parsed.get("__image__"):
+                                image_payload = parsed
+                                caption = parsed.get("caption", "")
+                                user_text = caption or "[User sent an image]"
+                                if ctx:
+                                    w = parsed.get("width", "?")
+                                    h = parsed.get("height", "?")
+                                    sz = parsed.get("file_size", 0)
+                                    await ctx.info(
+                                        f"Image received from Telegram ({w}x{h}, {sz} bytes)"
+                                    )
                     except (json.JSONDecodeError, TypeError):
                         pass
+
+                    # ── Return image as mixed content (text + image) ──
+                    if image_payload:
+                        metadata = {
+                            "success": True,
+                            "user_input": user_text,
+                            "character_count": len(user_text),
+                            "line_count": len(user_text.split('\n')),
+                            "cancelled": False,
+                            "platform": CURRENT_PLATFORM,
+                            "transport": "telegram",
+                            "has_image": True,
+                            "image_width": image_payload.get("width"),
+                            "image_height": image_payload.get("height"),
+                            "image_file_size": image_payload.get("file_size"),
+                            "image_mime_type": image_payload.get("mime_type", "image/jpeg"),
+                        }
+                        return [
+                            TextContent(type="text", text=json.dumps(metadata)),
+                            ImageContent(
+                                type="image",
+                                data=image_payload["image_b64"],
+                                mimeType=image_payload.get("mime_type", "image/jpeg"),
+                            ),
+                        ]
 
                     response = {
                         "success": True,
