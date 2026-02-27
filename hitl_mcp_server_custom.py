@@ -23,6 +23,7 @@ import re
 import urllib.request
 import urllib.error
 import base64
+import io
 from pydantic import Field
 from typing import Annotated
 # Set required environment variable for FastMCP 2.8.1+
@@ -38,6 +39,30 @@ except Exception:
 from fastmcp import FastMCP, Context
 from fastmcp.utilities.types import Image as FastMCPImage
 from mcp.types import ImageContent, TextContent
+
+np = None
+PILImage = None
+RapidOCR = None
+
+try:
+    import numpy as np
+    from PIL import Image as PILImage
+    from rapidocr_onnxruntime import RapidOCR
+    _OCR_ENGINE = RapidOCR()
+    _OCR_IMPORTED = True
+except Exception:
+    _OCR_ENGINE = None
+    _OCR_IMPORTED = False
+
+try:
+    import pygetwindow as gw
+except Exception:
+    gw = None
+
+try:
+    import pyautogui
+except Exception:
+    pyautogui = None
 
 # Whispr — optional voice-message transcription
 try:
@@ -488,6 +513,131 @@ def _telegram_download_photo(file_id: str) -> tuple:
     return data, mime_type
 
 
+def is_ocr_enabled() -> bool:
+    """Check whether OCR extraction is enabled for incoming Telegram images."""
+    value = os.getenv("HITL_OCR_ENABLED", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _extract_ocr_from_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
+    """Extract text from image bytes using RapidOCR (if available)."""
+    if not is_ocr_enabled():
+        return {
+            "ocr_enabled": False,
+            "ocr_available": _OCR_IMPORTED,
+            "ocr_text": "",
+            "ocr_lines": [],
+            "ocr_avg_confidence": None,
+        }
+
+    if not _OCR_IMPORTED or _OCR_ENGINE is None:
+        return {
+            "ocr_enabled": True,
+            "ocr_available": False,
+            "ocr_text": "",
+            "ocr_lines": [],
+            "ocr_avg_confidence": None,
+        }
+
+    try:
+        image = PILImage.open(io.BytesIO(image_bytes)).convert("RGB")
+        image_np = np.asarray(image)
+        ocr_result, _ = _OCR_ENGINE(image_np)
+
+        lines: List[Dict[str, Any]] = []
+        if ocr_result:
+            for item in ocr_result:
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    continue
+                text = str(item[1]).strip()
+                if not text:
+                    continue
+                try:
+                    score = float(item[2])
+                except Exception:
+                    score = None
+                lines.append({"text": text, "confidence": score})
+
+        joined_text = "\n".join(line["text"] for line in lines)
+        scores = [line["confidence"] for line in lines if isinstance(line.get("confidence"), float)]
+        avg_confidence = (sum(scores) / len(scores)) if scores else None
+
+        return {
+            "ocr_enabled": True,
+            "ocr_available": True,
+            "ocr_text": joined_text,
+            "ocr_lines": lines,
+            "ocr_avg_confidence": avg_confidence,
+        }
+    except Exception:
+        return {
+            "ocr_enabled": True,
+            "ocr_available": True,
+            "ocr_text": "",
+            "ocr_lines": [],
+            "ocr_avg_confidence": None,
+        }
+
+
+def _capture_window_screenshot(window_title_contains: str, max_size: int = 1400) -> Dict[str, Any]:
+    """Capture a screenshot of a window whose title contains the given text."""
+    if not IS_WINDOWS:
+        raise RuntimeError("Window screenshot by title is currently supported on Windows only")
+    if gw is None or pyautogui is None:
+        raise RuntimeError("Screenshot dependencies are missing (pygetwindow/pyautogui)")
+
+    title_query = (window_title_contains or "").strip().lower()
+    if not title_query:
+        raise RuntimeError("window_title_contains cannot be empty")
+
+    windows = []
+    for window in gw.getAllWindows():
+        title = (window.title or "").strip()
+        if title and title_query in title.lower():
+            windows.append(window)
+
+    if not windows:
+        raise RuntimeError(f"No visible window found with title containing: {window_title_contains}")
+
+    target = windows[0]
+    target_title = (target.title or "").strip()
+
+    try:
+        if target.isMinimized:
+            target.restore()
+    except Exception:
+        pass
+
+    time.sleep(0.2)
+
+    left, top, width, height = int(target.left), int(target.top), int(target.width), int(target.height)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Window has invalid bounds: {width}x{height}")
+
+    screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+    original_width, original_height = screenshot.size
+    largest_dim = max(original_width, original_height)
+    if max_size > 0 and largest_dim > max_size:
+        scale = max_size / float(largest_dim)
+        new_size = (max(1, int(original_width * scale)), max(1, int(original_height * scale)))
+        screenshot = screenshot.resize(new_size, resample=PILImage.Resampling.LANCZOS if PILImage else 1)
+
+    output = io.BytesIO()
+    screenshot.save(output, format="PNG")
+    image_bytes = output.getvalue()
+
+    return {
+        "window_title": target_title,
+        "image_bytes": image_bytes,
+        "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+        "mime_type": "image/png",
+        "width": screenshot.size[0],
+        "height": screenshot.size[1],
+        "file_size": len(image_bytes),
+    }
+
+
 # ── Whispr: voice-message confirmation flow ────────────────────────────────
 
 def _whispr_handle_voice_message(msg: Dict[str, Any], chat_id: str) -> Optional[str]:
@@ -858,6 +1008,8 @@ def _handle_help_command(chat_id: str) -> None:
             f"  /whispr model <name> — Set model (tiny/base/small/medium/large-v3)\n"
             f"  /whispr lang <code> — Set language (en/ru/auto)\n"
             "📷 **Images** — Send a photo or image file and it will be forwarded to the AI model\n"
+            "📝 **OCR** — Text is auto-extracted from images when OCR is enabled (`HITL_OCR_ENABLED=true`)\n"
+            "🖼 **Window screenshots** — Use MCP tool `get_window_screenshot` from the model side\n"
             "❓ /help — Show this help"
             f"{whispr_status}"
         ),
@@ -1018,6 +1170,7 @@ def _send_and_wait_telegram_multiline_input(
                                 "text": "📷 Photo received, downloading...",
                             }, timeout=10)
                             image_bytes, mime_type = _telegram_download_photo(file_id)
+                            ocr_meta = _extract_ocr_from_image_bytes(image_bytes)
                             image_b64 = base64.b64encode(image_bytes).decode("ascii")
                             # Encode as JSON payload so get_multiline_input can detect it
                             text = json.dumps({
@@ -1028,7 +1181,18 @@ def _send_and_wait_telegram_multiline_input(
                                 "file_size": len(image_bytes),
                                 "width": best_photo.get("width"),
                                 "height": best_photo.get("height"),
+                                "ocr_enabled": ocr_meta.get("ocr_enabled", False),
+                                "ocr_available": ocr_meta.get("ocr_available", False),
+                                "ocr_text": ocr_meta.get("ocr_text", ""),
+                                "ocr_lines": ocr_meta.get("ocr_lines", []),
+                                "ocr_avg_confidence": ocr_meta.get("ocr_avg_confidence"),
                             })
+                            if ocr_meta.get("ocr_text"):
+                                preview = ocr_meta["ocr_text"][:280]
+                                _telegram_api_call("sendMessage", {
+                                    "chat_id": chat_id,
+                                    "text": f"📝 OCR extracted text:\n{preview}" + ("…" if len(ocr_meta["ocr_text"]) > 280 else ""),
+                                }, timeout=10)
                             _telegram_api_call("sendMessage", {
                                 "chat_id": chat_id,
                                 "text": f"✅ Photo downloaded ({len(image_bytes)} bytes, {best_photo.get('width')}x{best_photo.get('height')}). Forwarding to model...",
@@ -1053,6 +1217,7 @@ def _send_and_wait_telegram_multiline_input(
                                 "text": "📷 Image file received, downloading...",
                             }, timeout=10)
                             image_bytes, _ = _telegram_download_photo(file_id)
+                            ocr_meta = _extract_ocr_from_image_bytes(image_bytes)
                             image_b64 = base64.b64encode(image_bytes).decode("ascii")
                             text = json.dumps({
                                 "__image__": True,
@@ -1062,7 +1227,18 @@ def _send_and_wait_telegram_multiline_input(
                                 "file_size": len(image_bytes),
                                 "width": None,
                                 "height": None,
+                                "ocr_enabled": ocr_meta.get("ocr_enabled", False),
+                                "ocr_available": ocr_meta.get("ocr_available", False),
+                                "ocr_text": ocr_meta.get("ocr_text", ""),
+                                "ocr_lines": ocr_meta.get("ocr_lines", []),
+                                "ocr_avg_confidence": ocr_meta.get("ocr_avg_confidence"),
                             })
+                            if ocr_meta.get("ocr_text"):
+                                preview = ocr_meta["ocr_text"][:280]
+                                _telegram_api_call("sendMessage", {
+                                    "chat_id": chat_id,
+                                    "text": f"📝 OCR extracted text:\n{preview}" + ("…" if len(ocr_meta["ocr_text"]) > 280 else ""),
+                                }, timeout=10)
                             _telegram_api_call("sendMessage", {
                                 "chat_id": chat_id,
                                 "text": f"✅ Image downloaded ({len(image_bytes)} bytes). Forwarding to model...",
@@ -2521,7 +2697,8 @@ async def get_multiline_input(
                             elif parsed.get("__image__"):
                                 image_payload = parsed
                                 caption = parsed.get("caption", "")
-                                user_text = caption or "[User sent an image]"
+                                extracted_text = str(parsed.get("ocr_text", "") or "").strip()
+                                user_text = caption or extracted_text or "[User sent an image]"
                                 if ctx:
                                     w = parsed.get("width", "?")
                                     h = parsed.get("height", "?")
@@ -2547,6 +2724,11 @@ async def get_multiline_input(
                             "image_height": image_payload.get("height"),
                             "image_file_size": image_payload.get("file_size"),
                             "image_mime_type": image_payload.get("mime_type", "image/jpeg"),
+                            "ocr_enabled": image_payload.get("ocr_enabled", False),
+                            "ocr_available": image_payload.get("ocr_available", False),
+                            "ocr_text": image_payload.get("ocr_text", ""),
+                            "ocr_lines": image_payload.get("ocr_lines", []),
+                            "ocr_avg_confidence": image_payload.get("ocr_avg_confidence"),
                         }
                         return [
                             TextContent(type="text", text=json.dumps(metadata)),
@@ -2683,6 +2865,58 @@ async def show_confirmation_dialog(
             "platform": CURRENT_PLATFORM
         }
 
+
+@mcp.tool()
+async def get_window_screenshot(
+    window_title_contains: Annotated[str, Field(description="Substring to match in the target window title")],
+    max_size: Annotated[int, Field(description="Maximum size in pixels for the largest image dimension")] = 1400,
+    ctx: Context = None,
+) -> Any:
+    """Capture a screenshot of a window by title and return it as MCP image content."""
+    try:
+        if ctx:
+            await ctx.info(f"Capturing screenshot for window containing: {window_title_contains}")
+
+        screenshot_data = await asyncio.to_thread(
+            _capture_window_screenshot,
+            window_title_contains,
+            max_size,
+        )
+
+        ocr_meta = _extract_ocr_from_image_bytes(screenshot_data["image_bytes"])
+
+        metadata = {
+            "success": True,
+            "window_title": screenshot_data["window_title"],
+            "width": screenshot_data["width"],
+            "height": screenshot_data["height"],
+            "file_size": screenshot_data["file_size"],
+            "mime_type": screenshot_data["mime_type"],
+            "ocr_enabled": ocr_meta.get("ocr_enabled", False),
+            "ocr_available": ocr_meta.get("ocr_available", False),
+            "ocr_text": ocr_meta.get("ocr_text", ""),
+            "ocr_lines": ocr_meta.get("ocr_lines", []),
+            "ocr_avg_confidence": ocr_meta.get("ocr_avg_confidence"),
+        }
+
+        return [
+            TextContent(type="text", text=json.dumps(metadata)),
+            ImageContent(
+                type="image",
+                data=screenshot_data["image_b64"],
+                mimeType=screenshot_data["mime_type"],
+            ),
+        ]
+
+    except Exception as e:
+        if ctx:
+            await ctx.error(f"Failed to capture window screenshot: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "platform": CURRENT_PLATFORM,
+        }
+
 @mcp.tool()
 async def show_info_message(
     title: Annotated[str, Field(description="Title of the information dialog")],
@@ -2758,6 +2992,7 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 - `get_user_input` - Single-line text/number input (names, values, paths, etc.)
 - `get_user_choice` - Multiple choice selection (pick from options)
 - `get_multiline_input` - Long-form text (descriptions, code, documents)
+- `get_window_screenshot` - Capture screenshot of a specific app window by title
 - `show_confirmation_dialog` - Yes/No decisions (confirmations, approvals)
 - `show_info_message` - Status updates and notifications
 
