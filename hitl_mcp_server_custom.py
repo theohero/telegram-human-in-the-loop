@@ -579,12 +579,135 @@ def _extract_ocr_from_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
         }
 
 
+def _try_win32_capture(hwnd: int, width: int, height: int) -> Optional[Any]:
+    """Capture a window using Win32 PrintWindow API.
+
+    Works even for minimized or occluded windows on Windows.
+    Returns a PIL Image or None if capture fails.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        if width <= 0 or height <= 0:
+            return None
+
+        hwnd_dc = user32.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
+
+        try:
+            mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+            if not mem_dc:
+                return None
+            try:
+                bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+                if not bitmap:
+                    return None
+                try:
+                    old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
+
+                    # PW_RENDERFULLCONTENT = 2  — captures even minimized windows
+                    PW_RENDERFULLCONTENT = 2
+                    result = user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT)
+
+                    if not result:
+                        # Retry without PW_RENDERFULLCONTENT
+                        result = user32.PrintWindow(hwnd, mem_dc, 0)
+
+                    if not result:
+                        return None
+
+                    gdi32.SelectObject(mem_dc, old_bitmap)
+
+                    class BITMAPINFOHEADER(ctypes.Structure):
+                        _fields_ = [
+                            ("biSize", ctypes.c_uint),
+                            ("biWidth", ctypes.c_int),
+                            ("biHeight", ctypes.c_int),
+                            ("biPlanes", ctypes.c_ushort),
+                            ("biBitCount", ctypes.c_ushort),
+                            ("biCompression", ctypes.c_uint),
+                            ("biSizeImage", ctypes.c_uint),
+                            ("biXPelsPerMeter", ctypes.c_int),
+                            ("biYPelsPerMeter", ctypes.c_int),
+                            ("biClrUsed", ctypes.c_uint),
+                            ("biClrImportant", ctypes.c_uint),
+                        ]
+
+                    bmi = BITMAPINFOHEADER()
+                    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                    bmi.biWidth = width
+                    bmi.biHeight = -height  # negative → top-down
+                    bmi.biPlanes = 1
+                    bmi.biBitCount = 32
+                    bmi.biCompression = 0  # BI_RGB
+
+                    buffer_size = width * height * 4
+                    buf = ctypes.create_string_buffer(buffer_size)
+
+                    gdi32.GetDIBits(
+                        hwnd_dc, bitmap, 0, height,
+                        buf, ctypes.byref(bmi), 0,
+                    )
+
+                    _pil = PILImage
+                    if _pil is None:
+                        try:
+                            from PIL import Image as _pil
+                        except ImportError:
+                            return None
+
+                    img = _pil.frombuffer(
+                        "RGBA", (width, height), buf, "raw", "BGRA", 0, 1,
+                    )
+                    return img.convert("RGB")
+                finally:
+                    gdi32.DeleteObject(bitmap)
+            finally:
+                gdi32.DeleteDC(mem_dc)
+        finally:
+            user32.ReleaseDC(hwnd, hwnd_dc)
+    except Exception:
+        return None
+
+
 def _capture_window_screenshot(window_title_contains: str, max_size: int = 1400) -> Dict[str, Any]:
-    """Capture a screenshot of a window whose title contains the given text."""
+    """Capture a screenshot of a window whose title contains the given text.
+
+    Primary: Win32 PrintWindow API (works even for minimized / occluded windows).
+    Fallback: pyautogui screen-region capture (requires the window to be visible).
+    """
+    global gw, pyautogui, PILImage
+
     if not IS_WINDOWS:
         raise RuntimeError("Window screenshot by title is currently supported on Windows only")
-    if gw is None or pyautogui is None:
-        raise RuntimeError("Screenshot dependencies are missing (pygetwindow/pyautogui)")
+
+    # ── lazy import retry (packages may be installed after server start) ──
+    if gw is None:
+        try:
+            import pygetwindow as _gw
+            gw = _gw
+        except ImportError:
+            pass
+    if pyautogui is None:
+        try:
+            import pyautogui as _pyautogui
+            pyautogui = _pyautogui
+        except ImportError:
+            pass
+    if PILImage is None:
+        try:
+            from PIL import Image as _PILImage
+            PILImage = _PILImage
+        except ImportError:
+            pass
+
+    if gw is None:
+        raise RuntimeError("pygetwindow is not installed. Run: pip install pygetwindow")
 
     title_query = (window_title_contains or "").strip().lower()
     if not title_query:
@@ -601,27 +724,80 @@ def _capture_window_screenshot(window_title_contains: str, max_size: int = 1400)
 
     target = windows[0]
     target_title = (target.title or "").strip()
-
+    is_minimized = False
     try:
-        if target.isMinimized:
-            target.restore()
+        is_minimized = target.isMinimized
     except Exception:
         pass
 
-    time.sleep(0.2)
+    screenshot = None
 
-    left, top, width, height = int(target.left), int(target.top), int(target.width), int(target.height)
-    if width <= 0 or height <= 0:
-        raise RuntimeError(f"Window has invalid bounds: {width}x{height}")
+    # ── Strategy 1: Win32 PrintWindow (works even minimized) ──
+    hwnd = getattr(target, "_hWnd", None)
+    if hwnd is not None:
+        try:
+            import ctypes
+            import ctypes.wintypes
 
-    screenshot = pyautogui.screenshot(region=(left, top, width, height))
+            if is_minimized:
+                # Get restored size from WINDOWPLACEMENT
+                class WINDOWPLACEMENT(ctypes.Structure):
+                    _fields_ = [
+                        ("length", ctypes.c_uint),
+                        ("flags", ctypes.c_uint),
+                        ("showCmd", ctypes.c_uint),
+                        ("ptMinPosition", ctypes.wintypes.POINT),
+                        ("ptMaxPosition", ctypes.wintypes.POINT),
+                        ("rcNormalPosition", ctypes.wintypes.RECT),
+                    ]
 
+                wp = WINDOWPLACEMENT()
+                wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+                ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp))
+                w = wp.rcNormalPosition.right - wp.rcNormalPosition.left
+                h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top
+            else:
+                rect = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+
+            if w > 0 and h > 0:
+                screenshot = _try_win32_capture(hwnd, w, h)
+        except Exception:
+            screenshot = None
+
+    # ── Strategy 2: pyautogui fallback (visible windows only) ──
+    if screenshot is None:
+        if pyautogui is None:
+            raise RuntimeError(
+                "pyautogui is not installed and Win32 capture failed. "
+                "Run: pip install pyautogui"
+            )
+        try:
+            if is_minimized:
+                target.restore()
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+        time.sleep(0.15)
+        left, top, width, height = (
+            int(target.left), int(target.top), int(target.width), int(target.height),
+        )
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Window has invalid bounds: {width}x{height}")
+        screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+    # ── Resize if needed ──
     original_width, original_height = screenshot.size
     largest_dim = max(original_width, original_height)
     if max_size > 0 and largest_dim > max_size:
         scale = max_size / float(largest_dim)
         new_size = (max(1, int(original_width * scale)), max(1, int(original_height * scale)))
-        screenshot = screenshot.resize(new_size, resample=PILImage.Resampling.LANCZOS if PILImage else 1)
+        resample = getattr(PILImage, "Resampling", None)
+        lanczos = resample.LANCZOS if resample else 1
+        screenshot = screenshot.resize(new_size, resample=lanczos)
 
     output = io.BytesIO()
     screenshot.save(output, format="PNG")
