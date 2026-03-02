@@ -29,6 +29,7 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 - AI sends prompts to your Telegram chat
 - You reply with text — AI receives it and continues working
 - Supports multi-line input, choices, confirmations, and info messages
+- **Auto-splitting** for long messages — messages over 4096 chars are automatically chunked at paragraph/newline/space boundaries with part indicators (📄 1/3, 2/3, etc.)
 
 ### 📸 Image Support (Telegram → AI)
 - **Send photos** from your phone/desktop directly to the AI
@@ -36,7 +37,7 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 - Includes **OCR extraction** — text in photos is automatically extracted
 - Perfect for: sharing error screenshots, UI mockups, diagrams, handwritten notes
 
-### � Local Image Browsing (AI → AI)
+### 🗂️ Local Image Browsing (AI → AI)
 - AI can **read any image file** from the local filesystem
 - Browse folders to discover and preview multiple images at once
 - Automatic **resizing** for large images (configurable max size)
@@ -44,7 +45,7 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 - Supports PNG, JPEG, GIF, BMP, WebP, TIFF, SVG
 - Toggleable via `HITL_IMAGE_TOOLS_ENABLED` environment variable
 
-### �🖥️ Window Screenshots (AI → Telegram)
+### 🖥️ Window Screenshots (AI → Telegram)
 - AI can capture screenshots of any window by title
 - **Win32 PrintWindow API** — works even for minimized or occluded windows
 - Automatic **OCR text extraction** from captured screenshots
@@ -307,6 +308,9 @@ Toggle Whispr with the `toggle_whispr` tool. Requires a local Whisper model to b
 ---
 
 ## ❓ FAQ
+
+**Q: Is there a message length limit?**
+A: No practical limit. Messages over 4096 characters (Telegram's limit) are automatically split into multiple messages with part indicators. The reply keyboard is attached only to the last chunk.
 
 **Q: Do I need all the optional dependencies?**
 A: No. The core functionality (text chat via Telegram) only needs `fastmcp` and `pydantic`. Install optional packages only for the features you want.
