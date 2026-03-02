@@ -1,6 +1,6 @@
 # 🤖💬 Telegram Human-in-the-Loop MCP Server
 
-> **Let your AI talk to you through Telegram.** This MCP server gives any AI coding assistant the ability to pause, ask you questions, and wait for your reply — right in your Telegram chat. Now with **image support**, **window screenshots**, **OCR**, and **voice message transcription**.
+> **Let your AI talk to you through Telegram.** This MCP server gives any AI coding assistant the ability to pause, ask you questions, and wait for your reply — right in your Telegram chat. Now with **image support**, **local file browsing**, **window screenshots**, **OCR**, and **voice message transcription**.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white" />
@@ -36,7 +36,15 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 - Includes **OCR extraction** — text in photos is automatically extracted
 - Perfect for: sharing error screenshots, UI mockups, diagrams, handwritten notes
 
-### 🖥️ Window Screenshots (AI → Telegram)
+### � Local Image Browsing (AI → AI)
+- AI can **read any image file** from the local filesystem
+- Browse folders to discover and preview multiple images at once
+- Automatic **resizing** for large images (configurable max size)
+- Optional **OCR text extraction** from local images
+- Supports PNG, JPEG, GIF, BMP, WebP, TIFF, SVG
+- Toggleable via `HITL_IMAGE_TOOLS_ENABLED` environment variable
+
+### �🖥️ Window Screenshots (AI → Telegram)
 - AI can capture screenshots of any window by title
 - **Win32 PrintWindow API** — works even for minimized or occluded windows
 - Automatic **OCR text extraction** from captured screenshots
@@ -79,6 +87,8 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 | `get_multiline_input` | Send a prompt to Telegram, wait for the user's reply. Supports **text**, **photos** (returned as ImageContent + OCR), and **voice messages** (Whispr transcription). Main communication tool. |
 | `get_user_input` | Simple text/number input dialog |
 | `get_user_choice` | Multiple choice selection dialog |
+| `get_image` | Read a single image file from the local filesystem. Resizes if needed, optional OCR. Returns image + metadata. |
+| `list_images` | Browse a folder for images. Returns up to N images with thumbnails + metadata. Supports sorting, filtering, recursive scan. |
 | `get_window_screenshot` | Capture a screenshot of any window by title. Uses Win32 PrintWindow (works minimized). Returns image + OCR metadata. Windows only. |
 | `show_confirmation_dialog` | Yes/No confirmation dialog |
 | `show_info_message` | Display information to the user |
@@ -301,6 +311,9 @@ Toggle Whispr with the `toggle_whispr` tool. Requires a local Whisper model to b
 **Q: Do I need all the optional dependencies?**
 A: No. The core functionality (text chat via Telegram) only needs `fastmcp` and `pydantic`. Install optional packages only for the features you want.
 
+**Q: Can I disable the image file browsing tools?**
+A: Yes. Set `HITL_IMAGE_TOOLS_ENABLED=false` in your environment or MCP config. The `get_image` and `list_images` tools will not be registered.
+
 **Q: Does it work without Telegram?**
 A: Yes! All tools fall back to native GUI popup dialogs (tkinter) when Telegram is not configured.
 
@@ -322,6 +335,8 @@ A: Text communication and image support work everywhere. Window screenshots (`ge
 | `TELEGRAM_BOT_TOKEN` | — | Telegram Bot API token (from @BotFather) |
 | `TELEGRAM_CHAT_ID` | — | Your Telegram Chat ID |
 | `HITL_TELEGRAM_TIMEOUT_SECONDS` | `3600` | How long to wait for a reply (seconds) |
+| `HITL_IMAGE_TOOLS_ENABLED` | `true` | Enable/disable `get_image` and `list_images` tools |
+| `HITL_OCR_ENABLED` | `true` | Enable/disable OCR text extraction from images |
 | `FASTMCP_LOG_LEVEL` | `INFO` | Logging level |
 
 ---

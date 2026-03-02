@@ -579,6 +579,101 @@ def _extract_ocr_from_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
         }
 
 
+# ── Image tools helpers ──
+
+def is_image_tools_enabled() -> bool:
+    """Check whether local image viewing tools (get_image, list_images) are enabled."""
+    value = os.getenv("HITL_IMAGE_TOOLS_ENABLED", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+_IMAGE_MIME_MAP = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".svg": "image/svg+xml",
+}
+
+_SUPPORTED_IMAGE_EXTENSIONS = set(_IMAGE_MIME_MAP.keys())
+
+
+def _read_and_resize_image(file_path: str, max_size: int = 1400) -> Dict[str, Any]:
+    """Read an image file and optionally resize it.
+
+    Returns a dict with keys:
+        image_bytes, image_b64, mime_type, original_width, original_height,
+        returned_width, returned_height, file_size, was_resized
+    """
+    file_path = os.path.abspath(os.path.expanduser(file_path))
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in _SUPPORTED_IMAGE_EXTENSIONS:
+        raise ValueError(f"Unsupported image format: {ext}. Supported: {', '.join(sorted(_SUPPORTED_IMAGE_EXTENSIONS))}")
+
+    raw_bytes = open(file_path, "rb").read()
+    file_size = len(raw_bytes)
+    mime_type = _IMAGE_MIME_MAP[ext]
+
+    # SVGs are not raster — return as-is
+    if ext == ".svg":
+        return {
+            "image_bytes": raw_bytes,
+            "image_b64": base64.b64encode(raw_bytes).decode("ascii"),
+            "mime_type": mime_type,
+            "original_width": None,
+            "original_height": None,
+            "returned_width": None,
+            "returned_height": None,
+            "file_size": file_size,
+            "was_resized": False,
+        }
+
+    original_width = original_height = None
+    returned_width = returned_height = None
+    was_resized = False
+    output_bytes = raw_bytes
+
+    if PILImage is not None:
+        try:
+            img = PILImage.open(io.BytesIO(raw_bytes))
+            original_width, original_height = img.size
+            returned_width, returned_height = original_width, original_height
+
+            if max(original_width, original_height) > max_size:
+                img.thumbnail((max_size, max_size), PILImage.LANCZOS)
+                returned_width, returned_height = img.size
+                was_resized = True
+
+                buf = io.BytesIO()
+                fmt = "PNG" if ext == ".png" else "JPEG"
+                img.save(buf, format=fmt)
+                output_bytes = buf.getvalue()
+        except Exception:
+            pass  # Fall back to raw bytes
+    else:
+        # PIL not available — return raw, no size info
+        pass
+
+    return {
+        "image_bytes": output_bytes,
+        "image_b64": base64.b64encode(output_bytes).decode("ascii"),
+        "mime_type": mime_type,
+        "original_width": original_width,
+        "original_height": original_height,
+        "returned_width": returned_width,
+        "returned_height": returned_height,
+        "file_size": file_size,
+        "was_resized": was_resized,
+    }
+
+
 def _try_win32_capture(hwnd: int, width: int, height: int) -> Optional[Any]:
     """Capture a window using Win32 PrintWindow API.
 
@@ -3093,6 +3188,198 @@ async def get_window_screenshot(
             "platform": CURRENT_PLATFORM,
         }
 
+
+@mcp.tool()
+async def get_image(
+    file_path: Annotated[str, Field(description="Absolute or relative path to the image file")],
+    max_size: Annotated[int, Field(description="Maximum dimension in pixels for the longest side. Images larger than this are resized proportionally.")] = 1400,
+    run_ocr: Annotated[bool, Field(description="Whether to extract text from the image using OCR")] = True,
+    ctx: Context = None,
+) -> Any:
+    """Read a single image from the local filesystem and return it so you can see it.
+
+    Supports PNG, JPG, GIF, BMP, WebP, TIFF, and SVG.  Large images are
+    automatically resized.  Text is extracted via OCR when available.
+    Toggle with env var HITL_IMAGE_TOOLS_ENABLED (default: true).
+    """
+    if not is_image_tools_enabled():
+        return {
+            "success": False,
+            "error": "Image tools are disabled. Set HITL_IMAGE_TOOLS_ENABLED=true to enable.",
+        }
+    try:
+        if ctx:
+            await ctx.info(f"Reading image: {file_path}")
+
+        data = await asyncio.to_thread(_read_and_resize_image, file_path, max_size)
+
+        ocr_meta: Dict[str, Any] = {}
+        if run_ocr:
+            ocr_meta = _extract_ocr_from_image_bytes(data["image_bytes"])
+
+        abs_path = os.path.abspath(os.path.expanduser(file_path))
+        metadata = {
+            "success": True,
+            "file_path": abs_path,
+            "file_name": os.path.basename(abs_path),
+            "original_width": data["original_width"],
+            "original_height": data["original_height"],
+            "returned_width": data["returned_width"],
+            "returned_height": data["returned_height"],
+            "file_size": data["file_size"],
+            "mime_type": data["mime_type"],
+            "was_resized": data["was_resized"],
+            "pil_available": PILImage is not None,
+            "ocr_enabled": ocr_meta.get("ocr_enabled", False),
+            "ocr_available": ocr_meta.get("ocr_available", _OCR_IMPORTED),
+            "ocr_text": ocr_meta.get("ocr_text", ""),
+            "ocr_lines": ocr_meta.get("ocr_lines", []),
+            "ocr_avg_confidence": ocr_meta.get("ocr_avg_confidence"),
+        }
+
+        return [
+            TextContent(type="text", text=json.dumps(metadata)),
+            ImageContent(
+                type="image",
+                data=data["image_b64"],
+                mimeType=data["mime_type"],
+            ),
+        ]
+
+    except (FileNotFoundError, ValueError) as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        if ctx:
+            await ctx.error(f"Failed to read image: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def list_images(
+    folder_path: Annotated[str, Field(description="Absolute or relative path to the folder to scan for images")],
+    pattern: Annotated[str, Field(description="Glob pattern to filter filenames (e.g. 'screenshot*', '*.png')")] = "*",
+    limit: Annotated[int, Field(description="Maximum number of images to return (1-20)")] = 5,
+    max_size: Annotated[int, Field(description="Maximum dimension per thumbnail in pixels")] = 800,
+    sort_by: Annotated[Literal["modified", "name", "size"], Field(description="Sort order: 'modified' (newest first), 'name' (alphabetical), 'size' (largest first)")] = "modified",
+    run_ocr: Annotated[bool, Field(description="Whether to run OCR on each image (slower for batches)")] = False,
+    recursive: Annotated[bool, Field(description="Whether to scan subdirectories recursively")] = False,
+    ctx: Context = None,
+) -> Any:
+    """Scan a folder for images and return thumbnails so you can see them.
+
+    Returns up to `limit` images sorted by the chosen criterion.  Each image
+    is resized to `max_size` pixels and returned as MCP image content.
+    Toggle with env var HITL_IMAGE_TOOLS_ENABLED (default: true).
+    """
+    if not is_image_tools_enabled():
+        return {
+            "success": False,
+            "error": "Image tools are disabled. Set HITL_IMAGE_TOOLS_ENABLED=true to enable.",
+        }
+    try:
+        import fnmatch as _fnmatch
+        import datetime as _dt
+
+        folder = os.path.abspath(os.path.expanduser(folder_path))
+        if not os.path.isdir(folder):
+            return {"success": False, "error": f"Folder not found: {folder}"}
+
+        limit = max(1, min(20, limit))
+
+        if ctx:
+            await ctx.info(f"Scanning folder: {folder} (pattern={pattern}, limit={limit})")
+
+        # Collect candidate files
+        candidates: list = []
+        if recursive:
+            for root, _dirs, files in os.walk(folder):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in _SUPPORTED_IMAGE_EXTENSIONS and _fnmatch.fnmatch(fname, pattern):
+                        try:
+                            stat = os.stat(fpath)
+                            candidates.append((fpath, fname, stat.st_mtime, stat.st_size))
+                        except OSError:
+                            pass
+        else:
+            for fname in os.listdir(folder):
+                fpath = os.path.join(folder, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in _SUPPORTED_IMAGE_EXTENSIONS and _fnmatch.fnmatch(fname, pattern):
+                    try:
+                        stat = os.stat(fpath)
+                        candidates.append((fpath, fname, stat.st_mtime, stat.st_size))
+                    except OSError:
+                        pass
+
+        # Sort
+        if sort_by == "modified":
+            candidates.sort(key=lambda c: c[2], reverse=True)
+        elif sort_by == "name":
+            candidates.sort(key=lambda c: c[1].lower())
+        elif sort_by == "size":
+            candidates.sort(key=lambda c: c[3], reverse=True)
+
+        total_found = len(candidates)
+        selected = candidates[:limit]
+
+        # Build results
+        images_meta: list = []
+        content_parts: list = []
+        skipped: list = []
+
+        for fpath, fname, mtime, fsize in selected:
+            try:
+                data = _read_and_resize_image(fpath, max_size)
+                ocr_text = ""
+                if run_ocr:
+                    ocr_result = _extract_ocr_from_image_bytes(data["image_bytes"])
+                    ocr_text = ocr_result.get("ocr_text", "")
+
+                images_meta.append({
+                    "file_name": fname,
+                    "file_path": fpath,
+                    "width": data["returned_width"],
+                    "height": data["returned_height"],
+                    "file_size": fsize,
+                    "mime_type": data["mime_type"],
+                    "modified": _dt.datetime.fromtimestamp(mtime).isoformat(),
+                    "ocr_text": ocr_text,
+                })
+                content_parts.append(
+                    ImageContent(
+                        type="image",
+                        data=data["image_b64"],
+                        mimeType=data["mime_type"],
+                    )
+                )
+            except Exception as exc:
+                skipped.append({"file": fpath, "error": str(exc)})
+
+        summary = {
+            "success": True,
+            "folder_path": folder,
+            "total_images_found": total_found,
+            "images_returned": len(images_meta),
+            "pattern": pattern,
+            "sort_by": sort_by,
+            "recursive": recursive,
+            "images": images_meta,
+        }
+        if skipped:
+            summary["skipped"] = skipped
+
+        return [TextContent(type="text", text=json.dumps(summary))] + content_parts
+
+    except Exception as e:
+        if ctx:
+            await ctx.error(f"Failed to list images: {e}")
+        return {"success": False, "error": str(e)}
+
+
 @mcp.tool()
 async def show_info_message(
     title: Annotated[str, Field(description="Title of the information dialog")],
@@ -3385,9 +3672,17 @@ async def health_check() -> Dict[str, Any]:
                 "get_multiline_input",
                 "show_confirmation_dialog",
                 "show_info_message",
+                "get_window_screenshot",
+                "get_image",
+                "list_images",
                 "get_human_loop_prompt",
                 "toggle_whispr"
-            ]
+            ],
+            "image_tools": {
+                "enabled": is_image_tools_enabled(),
+                "pil_available": PILImage is not None,
+                "ocr_available": _OCR_IMPORTED,
+            }
         }
     except Exception as e:
         return {
@@ -3440,6 +3735,11 @@ def main():
         print("  Toggle in Telegram: /whispr on | /whispr off")
     else:
         print("Whispr voice transcription: NOT AVAILABLE (install faster-whisper to enable)")
+
+    # ── Image tools status ──
+    img_state = "ENABLED" if is_image_tools_enabled() else "DISABLED"
+    pil_state = "available" if PILImage else "NOT available (install Pillow for resize)"
+    print(f"Image tools (get_image, list_images): {img_state} (PIL: {pil_state})")
 
     print("")
     
