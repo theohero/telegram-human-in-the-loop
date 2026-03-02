@@ -66,7 +66,7 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 | **Cursor** | ✅ Compatible | `.cursor/mcp.json` in workspace |
 | **Windsurf (Codeium)** | ✅ Compatible | `~/.codeium/windsurf/mcp_config.json` |
 | **Cline** | ✅ Compatible | Via Cline MCP settings UI |
-| **Any MCP stdio client** | ✅ Compatible | Pass `python hitl_mcp_server_custom.py` as command |
+| **Any MCP stdio client** | ✅ Compatible | Pass `python hitl_mcp_server.py` as command |
 
 > The server uses the standard **MCP stdio** transport — it works with **any client** that supports MCP.
 
@@ -178,7 +178,7 @@ Add to your `.vscode/mcp.json` or user `mcp.json`:
     "hitl-mcp-server": {
       "type": "stdio",
       "command": "python",
-      "args": ["path/to/hitl_mcp_server_custom.py"],
+      "args": ["path/to/hitl_mcp_server.py"],
       "env": {
         "TELEGRAM_BOT_TOKEN": "your-bot-token-here",
         "TELEGRAM_CHAT_ID": "your-chat-id-here"
@@ -197,7 +197,7 @@ Add to your Claude Desktop config:
   "mcpServers": {
     "hitl-mcp-server": {
       "command": "python",
-      "args": ["path/to/hitl_mcp_server_custom.py"],
+      "args": ["path/to/hitl_mcp_server.py"],
       "env": {
         "TELEGRAM_BOT_TOKEN": "your-bot-token-here",
         "TELEGRAM_CHAT_ID": "your-chat-id-here"
@@ -214,7 +214,7 @@ Add to your Claude Desktop config:
   "mcpServers": {
     "hitl-mcp-server": {
       "command": "python",
-      "args": ["path/to/hitl_mcp_server_custom.py"],
+      "args": ["path/to/hitl_mcp_server.py"],
       "env": {
         "TELEGRAM_BOT_TOKEN": "your-bot-token-here",
         "TELEGRAM_CHAT_ID": "your-chat-id-here"

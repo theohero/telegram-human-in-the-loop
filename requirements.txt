@@ -1,0 +1,17 @@
+fastmcp>=2.8.1
+pydantic>=2.0.0
+
+# Optional: Window screenshots (Windows only)
+# pip install pygetwindow pyautogui
+# pygetwindow>=0.0.9
+# pyautogui>=0.9.54
+
+# Optional: Image processing & OCR
+# pip install Pillow numpy rapidocr-onnxruntime
+# Pillow>=10.0.0
+# numpy>=1.24.0
+# rapidocr-onnxruntime>=1.3.0
+
+# Optional: Whispr voice-message transcription (requires CUDA for GPU acceleration)
+# pip install faster-whisper
+# faster-whisper>=1.0.0
