@@ -467,6 +467,86 @@ def _telegram_api_call(method: str, payload: Dict[str, Any], timeout: int = 35) 
         raise RuntimeError(f"Telegram API error for {method}: {parsed}")
     return parsed
 
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+def _split_telegram_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list:
+    """Split a long message into chunks that fit within Telegram's character limit.
+    
+    Splits at paragraph boundaries (double newline) first, then single newlines,
+    then at the last space before the limit. Returns a list of message strings.
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # Try to split at double newline (paragraph break) within limit
+        search_area = remaining[:max_length]
+        split_pos = search_area.rfind("\n\n")
+
+        if split_pos > max_length // 4:  # Found a reasonable paragraph break
+            chunks.append(remaining[:split_pos].rstrip())
+            remaining = remaining[split_pos:].lstrip("\n")
+            continue
+
+        # Try to split at single newline
+        split_pos = search_area.rfind("\n")
+        if split_pos > max_length // 4:
+            chunks.append(remaining[:split_pos].rstrip())
+            remaining = remaining[split_pos:].lstrip("\n")
+            continue
+
+        # Try to split at last space
+        split_pos = search_area.rfind(" ")
+        if split_pos > max_length // 4:
+            chunks.append(remaining[:split_pos])
+            remaining = remaining[split_pos:].lstrip()
+            continue
+
+        # Hard split as last resort
+        chunks.append(remaining[:max_length])
+        remaining = remaining[max_length:]
+
+    return [c for c in chunks if c.strip()]
+
+
+def _telegram_send_long_message(chat_id: str, text: str, reply_markup: str = None, timeout: int = 20) -> Dict[str, Any]:
+    """Send a message to Telegram, automatically splitting if it exceeds 4096 chars.
+    
+    Returns the API response for the LAST sent message (which is the one the user
+    should reply to). reply_markup is only attached to the last chunk.
+    """
+    chunks = _split_telegram_message(text)
+
+    last_result = None
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+        # Only attach keyboard/markup to the last message
+        if is_last and reply_markup:
+            payload["reply_markup"] = reply_markup
+        # Add part indicator for multi-part messages
+        if len(chunks) > 1:
+            chunk_header = f"📄 ({i+1}/{len(chunks)})\n"
+            if not is_last:
+                payload["text"] = chunk_header + chunk
+            else:
+                payload["text"] = chunk_header + chunk
+        last_result = _telegram_api_call("sendMessage", payload, timeout=timeout)
+        # Small delay between chunks to avoid rate limiting
+        if not is_last:
+            time.sleep(0.3)
+
+    return last_result
+
+
 def _telegram_init_offset() -> None:
     """Initialize update offset so old messages are ignored on first use."""
     global _telegram_last_update_id
@@ -1327,13 +1407,12 @@ def _send_and_wait_telegram_multiline_input(
     if default_value:
         message_lines.extend(["", "Default value:", default_value])
 
-    # ── Send with inline keyboard ──
+    # ── Send with inline keyboard (auto-splits long messages) ──
     keyboard = coord.build_inline_keyboard() if coord else []
-    payload: Dict[str, Any] = {"chat_id": chat_id, "text": "\n".join(message_lines)}
-    if keyboard:
-        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    full_text = "\n".join(message_lines)
+    reply_markup = json.dumps({"inline_keyboard": keyboard}) if keyboard else None
 
-    sent = _telegram_api_call("sendMessage", payload, timeout=20)
+    sent = _telegram_send_long_message(chat_id, full_text, reply_markup=reply_markup, timeout=20)
     sent_message_id = sent.get("result", {}).get("message_id")
 
     if coord and sent_message_id:
