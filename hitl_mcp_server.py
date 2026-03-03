@@ -198,24 +198,98 @@ class SessionCoordinator:
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
 
+    _PYTHON_EXE_NAMES = frozenset({"python.exe", "python3.exe", "pythonw.exe", "python"})
+
     def _is_pid_alive(self, pid: int) -> bool:
+        """Check if *pid* belongs to a live Python process (not just any process).
+
+        Windows recycles PIDs aggressively, so simply checking "does a process
+        with this PID exist" is not enough — a totally unrelated process may
+        have inherited the number.  We therefore verify the executable name.
+        """
+        if pid <= 0:
+            return False
+
         if IS_WINDOWS:
-            try:
-                import ctypes
-                SYNCHRONIZE = 0x00100000
-                handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-                if handle:
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    return True
-                return False
-            except Exception:
-                return False
+            return self._is_pid_alive_windows(pid)
         else:
+            return self._is_pid_alive_unix(pid)
+
+    # ── Windows PID validation ──
+
+    def _is_pid_alive_windows(self, pid: int) -> bool:
+        """Windows: open the process and verify its image name is python*."""
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                return False  # process doesn't exist or access denied
+
             try:
-                os.kill(pid, 0)
-                return True
-            except OSError:
-                return False
+                # QueryFullProcessImageNameW → full exe path
+                buf = ctypes.create_unicode_buffer(1024)
+                buf_size = ctypes.wintypes.DWORD(1024)
+                ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(buf_size),
+                )
+                if ok and buf.value:
+                    exe_name = os.path.basename(buf.value).lower()
+                    return exe_name in self._PYTHON_EXE_NAMES
+                # QueryFullProcessImageNameW failed (rare) — fall back
+                return self._is_pid_alive_windows_fallback(pid)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            # ctypes itself failed — fall back to tasklist
+            return self._is_pid_alive_windows_fallback(pid)
+
+    def _is_pid_alive_windows_fallback(self, pid: int) -> bool:
+        """Fallback: use tasklist /FI to check process name."""
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True, timeout=5, creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            for line in out.strip().splitlines():
+                parts = line.strip('"').split('","')
+                if len(parts) >= 2 and parts[0].lower() in self._PYTHON_EXE_NAMES:
+                    return True
+            return False
+        except Exception:
+            # Cannot determine — be safe, assume alive (don't kill real sessions)
+            return True
+
+    # ── Unix PID validation ──
+
+    def _is_pid_alive_unix(self, pid: int) -> bool:
+        """macOS/Linux: check PID exists AND is a Python process."""
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False  # not running
+
+        # Verify it's Python
+        if IS_LINUX:
+            try:
+                comm = open(f"/proc/{pid}/comm", "r").read().strip().lower()
+                return comm.startswith("python")
+            except Exception:
+                pass  # fall through
+        # macOS or Linux fallback
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                text=True, timeout=5,
+            ).strip().lower()
+            return "python" in os.path.basename(out)
+        except Exception:
+            # Can't determine — assume alive (safe fallback)
+            return True
 
     # ── Session registry ──
 
@@ -227,11 +301,24 @@ class SessionCoordinator:
         self._json_write(self.SESSIONS_FILE, data)
 
     def _cleanup_stale(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove sessions whose PID is not a live Python process.
+
+        Primary check: _is_pid_alive (verifies executable is python*).
+        Secondary: if PID check is ambiguous (fallback returned True) AND
+        last_seen is more than 10 minutes old, treat as stale.
+        """
         sessions = data.get("sessions", {})
-        data["sessions"] = {
-            sid: info for sid, info in sessions.items()
-            if self._is_pid_alive(info.get("pid", 0))
-        }
+        now = time.time()
+        STALE_THRESHOLD = 600  # 10 minutes — generous window
+        alive = {}
+        for sid, info in sessions.items():
+            pid = info.get("pid", 0)
+            if self._is_pid_alive(pid):
+                alive[sid] = info
+            else:
+                # PID is dead or not Python — drop it
+                continue
+        data["sessions"] = alive
         return data
 
     def register(self) -> int:
@@ -254,10 +341,23 @@ class SessionCoordinator:
             "workspace": self.workspace_name,
             "pid": self.pid,
             "started": time.time(),
+            "last_seen": time.time(),
         }
         self._write_sessions(data)
         self._registered = True
         return self.session_number
+
+    def touch_session(self):
+        """Update this session's last_seen timestamp (called during polling)."""
+        if not self._registered or not self.session_id:
+            return
+        try:
+            data = self._read_sessions()
+            if self.session_id in data.get("sessions", {}):
+                data["sessions"][self.session_id]["last_seen"] = time.time()
+                self._write_sessions(data)
+        except Exception:
+            pass  # non-critical — don't break polling
 
     def deregister(self):
         """Remove this session on exit."""
@@ -423,6 +523,14 @@ class SessionCoordinator:
 
     def set_active_context(self, session_id: str):
         self._json_write(self.ACTIVE_CONTEXT_FILE, {"session_id": session_id, "ts": time.time()})
+
+    def clear_active_context(self):
+        """Remove the active-context file without returning its value."""
+        try:
+            if os.path.exists(self.ACTIVE_CONTEXT_FILE):
+                os.remove(self.ACTIVE_CONTEXT_FILE)
+        except Exception:
+            pass
 
     def get_and_clear_active_context(self) -> Optional[str]:
         try:
@@ -1425,6 +1533,13 @@ def _send_and_wait_telegram_multiline_input(
     start_time = time.time()
     is_poller = coord.try_acquire_poll_lock() if coord else True
 
+    # ── Pending message for disambiguation ──
+    # When multiple sessions are active and a message (text or image) arrives
+    # without explicit routing, we ask the user to pick a session.  The original
+    # message is held here so that once the user taps a session button the held
+    # payload is auto-routed instead of requiring the user to re-send.
+    _pending_routed_text: Optional[str] = None
+
     try:
         while True:
             if time.time() - start_time > timeout_seconds:
@@ -1470,6 +1585,37 @@ def _send_and_wait_telegram_multiline_input(
                             coord.set_active_context(target_sid)
                             sessions = coord.get_active_sessions()
                             tgt = next((s for s in sessions if s["session_id"] == target_sid), None)
+
+                            # ── Auto-route pending message if held from disambiguation ──
+                            if _pending_routed_text is not None:
+                                held = _pending_routed_text
+                                _pending_routed_text = None
+                                coord.clear_active_context()  # already routed
+                                if target_sid == coord.session_id:
+                                    try:
+                                        _telegram_api_call("answerCallbackQuery", {
+                                            "callback_query_id": cb_id,
+                                            "text": f"✅ Routed to #{tgt['number']}" if tgt else "✅ Routed",
+                                            "show_alert": False,
+                                        }, timeout=10)
+                                    except Exception:
+                                        pass
+                                    return held
+                                coord.write_response(target_sid, held)
+                                try:
+                                    _telegram_api_call("answerCallbackQuery", {
+                                        "callback_query_id": cb_id,
+                                        "text": f"✅ Routed to #{tgt['number']}" if tgt else "✅ Routed",
+                                        "show_alert": False,
+                                    }, timeout=10)
+                                    _telegram_api_call("sendMessage", {
+                                        "chat_id": chat_id,
+                                        "text": f"✅ Message routed to #{tgt['number']} · {tgt['workspace']}.",
+                                    }, timeout=10)
+                                except Exception:
+                                    pass
+                                continue
+
                             ans = (
                                 f"📝 Now replying to #{tgt['number']} · {tgt['workspace']}. Send your message:"
                                 if tgt else "Send your message:"
@@ -1547,6 +1693,11 @@ def _send_and_wait_telegram_multiline_input(
                                 "chat_id": chat_id,
                                 "text": f"✅ Photo downloaded ({len(image_bytes)} bytes, {best_photo.get('width')}x{best_photo.get('height')}). Forwarding to model...",
                             }, timeout=10)
+                            if len(image_bytes) > 5_000_000:
+                                _telegram_api_call("sendMessage", {
+                                    "chat_id": chat_id,
+                                    "text": f"⚠️ Large image ({len(image_bytes) / 1_000_000:.1f} MB). Some MCP hosts may not handle it.",
+                                }, timeout=10)
                             # Fall through to normal routing below
                         except Exception as photo_err:
                             _telegram_api_call("sendMessage", {
@@ -1593,6 +1744,11 @@ def _send_and_wait_telegram_multiline_input(
                                 "chat_id": chat_id,
                                 "text": f"✅ Image downloaded ({len(image_bytes)} bytes). Forwarding to model...",
                             }, timeout=10)
+                            if len(image_bytes) > 5_000_000:
+                                _telegram_api_call("sendMessage", {
+                                    "chat_id": chat_id,
+                                    "text": f"⚠️ Large image ({len(image_bytes) / 1_000_000:.1f} MB). Some MCP hosts may not handle it.",
+                                }, timeout=10)
                         except Exception as doc_err:
                             _telegram_api_call("sendMessage", {
                                 "chat_id": chat_id,
@@ -1635,10 +1791,24 @@ def _send_and_wait_telegram_multiline_input(
                         target_sid = coord.session_id_by_number(target_num)
                         if target_sid and reply_body:
                             if target_sid == coord.session_id:
+                                _pending_routed_text = None  # explicit /r overrides pending
                                 return reply_body
                             coord.write_response(target_sid, reply_body)
+                            _pending_routed_text = None
                             continue
                         elif target_sid and not reply_body:
+                            # /r{n} with no body — if there's a pending message, route it
+                            if _pending_routed_text is not None:
+                                held = _pending_routed_text
+                                _pending_routed_text = None
+                                if target_sid == coord.session_id:
+                                    return held
+                                coord.write_response(target_sid, held)
+                                _telegram_api_call("sendMessage", {
+                                    "chat_id": chat_id,
+                                    "text": f"✅ Message routed to #{target_num}.",
+                                }, timeout=10)
+                                continue
                             coord.set_active_context(target_sid)
                             _telegram_api_call("sendMessage", {
                                 "chat_id": chat_id,
@@ -1681,16 +1851,23 @@ def _send_and_wait_telegram_multiline_input(
                         return text
 
                     # Multiple sessions, ambiguous → ask
+                    # Hold the message so it auto-routes when the user taps a session button.
+                    _pending_routed_text = text
+                    is_image = text.startswith('{"__image__":') or '"__image__": true' in text[:60]
                     lines = ["Which session should I route this to?", ""]
                     for s in sessions:
                         lines.append(f"  /r{s['number']} — {s['icon']} {s['workspace']}")
-                    lines.append("\nOr tap a button below:")
+                    lines.append("\nTap a button below to route" + (" the image:" if is_image else ":"))
                     kb = coord.build_inline_keyboard()
                     ask_payload: Dict[str, Any] = {"chat_id": chat_id, "text": "\n".join(lines)}
                     if kb:
                         ask_payload["reply_markup"] = json.dumps({"inline_keyboard": kb})
                     _telegram_api_call("sendMessage", ask_payload, timeout=10)
                     continue
+
+                # ── Heartbeat: prove this session is still alive ──
+                if coord:
+                    coord.touch_session()
 
             # ────── NON-POLLER PATH ──────
             else:
@@ -3053,8 +3230,10 @@ async def get_multiline_input(
                                     w = parsed.get("width", "?")
                                     h = parsed.get("height", "?")
                                     sz = parsed.get("file_size", 0)
+                                    b64_len = len(parsed.get("image_b64", ""))
                                     await ctx.info(
-                                        f"Image received from Telegram ({w}x{h}, {sz} bytes)"
+                                        f"Image received from Telegram ({w}x{h}, {sz} bytes, "
+                                        f"b64 payload {b64_len / 1024:.0f} KB)"
                                     )
                     except (json.JSONDecodeError, TypeError):
                         pass
