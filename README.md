@@ -191,8 +191,8 @@ Add to your `.vscode/mcp.json` or user `mcp.json`:
       "command": "python",
       "args": ["path/to/hitl_mcp_server.py"],
       "env": {
-        "TELEGRAM_BOT_TOKEN": "your-bot-token-here",
-        "TELEGRAM_CHAT_ID": "your-chat-id-here"
+        "HITL_TELEGRAM_BOT_TOKEN": "your-bot-token-here",
+        "HITL_TELEGRAM_CHAT_ID": "your-chat-id-here"
       }
     }
   }
@@ -210,8 +210,8 @@ Add to your Claude Desktop config:
       "command": "python",
       "args": ["path/to/hitl_mcp_server.py"],
       "env": {
-        "TELEGRAM_BOT_TOKEN": "your-bot-token-here",
-        "TELEGRAM_CHAT_ID": "your-chat-id-here"
+        "HITL_TELEGRAM_BOT_TOKEN": "your-bot-token-here",
+        "HITL_TELEGRAM_CHAT_ID": "your-chat-id-here"
       }
     }
   }
@@ -227,8 +227,8 @@ Add to your Claude Desktop config:
       "command": "python",
       "args": ["path/to/hitl_mcp_server.py"],
       "env": {
-        "TELEGRAM_BOT_TOKEN": "your-bot-token-here",
-        "TELEGRAM_CHAT_ID": "your-chat-id-here"
+        "HITL_TELEGRAM_BOT_TOKEN": "your-bot-token-here",
+        "HITL_TELEGRAM_CHAT_ID": "your-chat-id-here"
       }
     }
   }
