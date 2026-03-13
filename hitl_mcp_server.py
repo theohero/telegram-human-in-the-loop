@@ -576,6 +576,163 @@ def _telegram_api_call(method: str, payload: Dict[str, Any], timeout: int = 35) 
     return parsed
 
 
+# ── Daemon Adapter ─────────────────────────────────────────────────────────
+#
+# When the HITL daemon is running, the MCP server delegates Telegram
+# communication to the daemon via its HTTP API instead of calling
+# getUpdates directly.  This avoids update-stealing: only the daemon
+# polls Telegram, and routes replies back through /poll.
+
+_daemon_url: Optional[str] = None          # e.g. "http://127.0.0.1:19876"
+_daemon_session_id: Optional[str] = None   # assigned by POST /register
+_daemon_available: Optional[bool] = None   # cached after first probe
+_daemon_secret: str = ""                   # optional shared secret
+_daemon_check_interval: float = 60.0       # re-probe interval (seconds)
+_daemon_last_check: float = 0.0
+
+
+def _daemon_http(method: str, path: str, body: Optional[dict] = None,
+                 timeout: int = 70) -> Optional[dict]:
+    """Make an HTTP request to the daemon. Returns parsed JSON or None on error."""
+    url = f"{_daemon_url}{path}"
+    headers = {"Content-Type": "application/json"}
+    if _daemon_secret:
+        headers["Authorization"] = f"Bearer {_daemon_secret}"
+
+    try:
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        else:
+            req = urllib.request.Request(url, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logging.getLogger("hitl-mcp").debug("Daemon HTTP %s %s failed: %s", method, path, e)
+        return None
+
+
+def _daemon_check() -> bool:
+    """Return True if the HITL daemon is reachable. Caches result briefly."""
+    global _daemon_available, _daemon_last_check, _daemon_url, _daemon_secret
+
+    now = time.time()
+    if _daemon_available is not None and (now - _daemon_last_check) < _daemon_check_interval:
+        return _daemon_available
+
+    _daemon_url = os.getenv("HITL_DAEMON_URL", "http://127.0.0.1:19876").rstrip("/")
+    _daemon_secret = os.getenv("HITL_DAEMON_SECRET", "").strip()
+
+    result = _daemon_http("GET", "/health", timeout=3)
+    _daemon_last_check = now
+    _daemon_available = result is not None and result.get("status") == "ok"
+
+    if _daemon_available:
+        logging.getLogger("hitl-mcp").info("Daemon detected at %s", _daemon_url)
+    return _daemon_available
+
+
+def _daemon_register() -> Optional[str]:
+    """Register with the daemon and return the session_id, or None on failure."""
+    global _daemon_session_id
+
+    if _daemon_session_id:
+        return _daemon_session_id
+
+    workspace = os.getenv("HITL_SESSION_NAME", "").strip()
+    if not workspace:
+        workspace = os.path.basename(os.getcwd()) or "mcp-session"
+
+    result = _daemon_http("POST", "/register", {
+        "workspace_name": workspace,
+        "pid": os.getpid(),
+    }, timeout=5)
+
+    if result and "session_id" in result:
+        _daemon_session_id = result["session_id"]
+        num = result.get("session_number", "?")
+        icon = result.get("session_icon", "")
+        logging.getLogger("hitl-mcp").info(
+            "Registered with daemon: %s #%s (session=%s)", icon, num, _daemon_session_id
+        )
+        return _daemon_session_id
+
+    logging.getLogger("hitl-mcp").warning("Daemon registration failed: %s", result)
+    return None
+
+
+def _daemon_deregister() -> None:
+    """Deregister from the daemon on shutdown."""
+    global _daemon_session_id
+    if _daemon_session_id and _daemon_url:
+        _daemon_http("POST", "/deregister", {"session_id": _daemon_session_id}, timeout=3)
+        _daemon_session_id = None
+
+
+def _daemon_send_and_poll(
+    title: str,
+    prompt: str,
+    default_value: str = "",
+    timeout_seconds: int = 1800,
+) -> Optional[str]:
+    """Send a prompt and long-poll for reply via the daemon HTTP API.
+
+    Returns the reply text (possibly JSON for __whispr__/__image__), or None on timeout.
+    Uses chunked polling: repeats /poll calls of up to 55s each until the overall
+    timeout expires, keeping the HTTP connection fresh.
+    """
+    session_id = _daemon_register()
+    if not session_id:
+        return None  # registration failed — caller should fall back
+
+    # ── Build prompt text ──
+    full_prompt = prompt
+    if default_value:
+        full_prompt += f"\n\nDefault value:\n{default_value}"
+
+    # ── Send the message ──
+    send_result = _daemon_http("POST", "/send", {
+        "session_id": session_id,
+        "title": title,
+        "prompt": full_prompt,
+    }, timeout=15)
+
+    if not send_result or not send_result.get("ok"):
+        logging.getLogger("hitl-mcp").error("Daemon /send failed: %s", send_result)
+        return None
+
+    # ── Poll for reply (chunked long-poll) ──
+    start = time.time()
+    poll_chunk = min(55, timeout_seconds)  # per-chunk timeout
+
+    while True:
+        remaining = timeout_seconds - (time.time() - start)
+        if remaining <= 0:
+            return None
+
+        chunk_timeout = min(poll_chunk, remaining)
+        poll_result = _daemon_http("POST", "/poll", {
+            "session_id": session_id,
+            "timeout_seconds": chunk_timeout,
+        }, timeout=int(chunk_timeout) + 15)  # HTTP timeout > poll timeout
+
+        if poll_result is None:
+            # HTTP error — brief retry
+            time.sleep(1)
+            continue
+
+        source = poll_result.get("source", "")
+        reply = poll_result.get("reply")
+
+        if source in ("live", "pending") and reply is not None:
+            return reply
+
+        # source == "timeout" → loop again until overall timeout
+
+
+# ── End Daemon Adapter ─────────────────────────────────────────────────────
+
+
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
 def _split_telegram_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list:
@@ -1484,6 +1641,9 @@ def _send_and_wait_telegram_multiline_input(
 ) -> Optional[str]:
     """Send prompt to Telegram with session tagging and wait for a reply.
 
+    When the HITL daemon is running, delegates to the daemon's HTTP API
+    to avoid update-stealing (both processes calling getUpdates).
+
     Supports multi-instance coordination:
     - Only ONE instance polls Telegram at a time (file-lock).
     - Other instances wait for a response file written by the poller.
@@ -1494,6 +1654,14 @@ def _send_and_wait_telegram_multiline_input(
         4. Single-session fallback
         5. Ambiguous → disambiguation prompt
     """
+    # ── Daemon adapter: delegate if daemon is running ──
+    if _daemon_check():
+        result = _daemon_send_and_poll(title, prompt, default_value, timeout_seconds)
+        if result is not None or _daemon_available:
+            # If daemon is available, always use its result (even None = timeout).
+            # Only fall through to direct polling if daemon probe actually failed.
+            return result
+
     global _telegram_last_update_id, _session_coordinator
     coord = _session_coordinator
 
@@ -3235,6 +3403,27 @@ async def get_multiline_input(
                                         f"Image received from Telegram ({w}x{h}, {sz} bytes, "
                                         f"b64 payload {b64_len / 1024:.0f} KB)"
                                     )
+                            # ── Image album (multiple images) ──
+                            elif parsed.get("__image_album__"):
+                                images = parsed.get("images", [])
+                                caption = parsed.get("caption", "")
+                                user_text = caption or f"[User sent {len(images)} images]"
+                                # Use first image as the main payload for display
+                                if images:
+                                    first = images[0]
+                                    image_payload = {
+                                        "__image__": True,
+                                        "image_b64": first.get("image_b64", ""),
+                                        "mime_type": first.get("mime_type", "image/jpeg"),
+                                        "caption": user_text,
+                                        "file_size": first.get("file_size", 0),
+                                    }
+                                if ctx:
+                                    total_size = sum(img.get("file_size", 0) for img in images)
+                                    await ctx.info(
+                                        f"Image album received from Telegram: {len(images)} images, "
+                                        f"{total_size} bytes total"
+                                    )
                     except (json.JSONDecodeError, TypeError):
                         pass
 
@@ -3970,7 +4159,21 @@ def main():
     print("toggle_whispr - Enable/disable voice transcription (Whispr)")
     if is_telegram_enabled():
         print("Telegram transport: ENABLED (get_multiline_input will send+await via Telegram)")
-        # ── Session coordination ──
+
+        # ── Daemon detection ──
+        if _daemon_check():
+            sid = _daemon_register()
+            if sid:
+                atexit.register(_daemon_deregister)
+                print(f"HITL Daemon: CONNECTED at {_daemon_url} (session={sid})")
+                print("  → Telegram polling delegated to daemon (no update stealing)")
+            else:
+                print("HITL Daemon: detected but registration FAILED — falling back to direct polling")
+        else:
+            print(f"HITL Daemon: not detected at {_daemon_url or 'http://127.0.0.1:19876'}")
+            print("  → Using direct Telegram polling (start daemon to avoid conflicts)")
+
+        # ── Session coordination (legacy direct-polling mode) ──
         _session_coordinator = SessionCoordinator()
         num = _session_coordinator.register()
         atexit.register(_session_coordinator.deregister)
