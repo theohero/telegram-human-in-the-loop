@@ -594,7 +594,11 @@ _daemon_last_check: float = 0.0
 
 def _daemon_http(method: str, path: str, body: Optional[dict] = None,
                  timeout: int = 70) -> Optional[dict]:
-    """Make an HTTP request to the daemon. Returns parsed JSON or None on error."""
+    """Make an HTTP request to the daemon. Returns parsed JSON or None on error.
+
+    For HTTP error responses (4xx, 5xx), attempts to parse the error body and
+    returns it as a dict (usually containing an 'error' key).
+    """
     url = f"{_daemon_url}{path}"
     headers = {"Content-Type": "application/json"}
     if _daemon_secret:
@@ -608,6 +612,19 @@ def _daemon_http(method: str, path: str, body: Optional[dict] = None,
             req = urllib.request.Request(url, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Parse JSON error body from daemon (e.g. {"error": "Session ... not found"})
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+            logging.getLogger("hitl-mcp").debug(
+                "Daemon HTTP %s %s → %d: %s", method, path, e.code, err_body
+            )
+            return err_body
+        except Exception:
+            logging.getLogger("hitl-mcp").debug(
+                "Daemon HTTP %s %s → %d", method, path, e.code
+            )
+            return None
     except Exception as e:
         logging.getLogger("hitl-mcp").debug("Daemon HTTP %s %s failed: %s", method, path, e)
         return None
@@ -682,6 +699,8 @@ def _daemon_send_and_poll(
     Uses chunked polling: repeats /poll calls of up to 55s each until the overall
     timeout expires, keeping the HTTP connection fresh.
     """
+    global _daemon_session_id
+
     session_id = _daemon_register()
     if not session_id:
         return None  # registration failed — caller should fall back
@@ -699,8 +718,32 @@ def _daemon_send_and_poll(
     }, timeout=15)
 
     if not send_result or not send_result.get("ok"):
-        logging.getLogger("hitl-mcp").error("Daemon /send failed: %s", send_result)
-        return None
+        # Session may be stale (daemon restarted) — clear cache and retry once
+        err_msg = str(send_result.get("error", "")) if send_result else ""
+        if "not found" in err_msg.lower() or "unknown" in err_msg.lower():
+            logging.getLogger("hitl-mcp").warning(
+                "Daemon rejected session %s, re-registering...", session_id
+            )
+            _daemon_session_id = None
+            session_id = _daemon_register()
+            if session_id:
+                send_result = _daemon_http("POST", "/send", {
+                    "session_id": session_id,
+                    "title": title,
+                    "prompt": full_prompt,
+                }, timeout=15)
+                if send_result and send_result.get("ok"):
+                    pass  # fall through to polling
+                else:
+                    logging.getLogger("hitl-mcp").error(
+                        "Daemon /send failed after re-register: %s", send_result
+                    )
+                    return None
+            else:
+                return None
+        else:
+            logging.getLogger("hitl-mcp").error("Daemon /send failed: %s", send_result)
+            return None
 
     # ── Poll for reply (chunked long-poll) ──
     start = time.time()
