@@ -699,7 +699,7 @@ def _daemon_send_and_poll(
     Uses chunked polling: repeats /poll calls of up to 55s each until the overall
     timeout expires, keeping the HTTP connection fresh.
     """
-    global _daemon_session_id
+    global _daemon_session_id, _daemon_available, _daemon_last_check
 
     session_id = _daemon_register()
     if not session_id:
@@ -748,6 +748,8 @@ def _daemon_send_and_poll(
     # ── Poll for reply (chunked long-poll) ──
     start = time.time()
     poll_chunk = min(55, timeout_seconds)  # per-chunk timeout
+    consecutive_http_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 5  # fall back to direct mode after this many
 
     while True:
         remaining = timeout_seconds - (time.time() - start)
@@ -761,8 +763,57 @@ def _daemon_send_and_poll(
         }, timeout=int(chunk_timeout) + 15)  # HTTP timeout > poll timeout
 
         if poll_result is None:
-            # HTTP error — brief retry
+            # HTTP error (connection refused, etc.)
+            consecutive_http_failures += 1
+            if consecutive_http_failures >= MAX_CONSECUTIVE_FAILURES:
+                logging.getLogger("hitl-mcp").warning(
+                    "Daemon unreachable after %d consecutive failures, "
+                    "falling back to direct mode.", consecutive_http_failures,
+                )
+                # Invalidate daemon cache so next call uses direct mode
+                _daemon_available = False
+                _daemon_last_check = time.time()
+                _daemon_session_id = None
+                # Fall back to direct Telegram polling for this request
+                return _telegram_poll_for_response(
+                    title, prompt, default_value, timeout_seconds=int(remaining),
+                )
             time.sleep(1)
+            continue
+
+        consecutive_http_failures = 0  # reset on successful HTTP
+
+        # ── Stale session: daemon restarted and lost our registration ──
+        if not poll_result.get("ok", True):
+            err_msg = str(poll_result.get("error", ""))
+            if "not found" in err_msg.lower() or "unknown" in err_msg.lower():
+                logging.getLogger("hitl-mcp").warning(
+                    "Daemon lost session %s during poll, re-registering...",
+                    session_id,
+                )
+                _daemon_session_id = None
+                new_sid = _daemon_register()
+                if new_sid:
+                    session_id = new_sid
+                    # Re-send the original message under the new session
+                    re_send = _daemon_http("POST", "/send", {
+                        "session_id": session_id,
+                        "title": title,
+                        "prompt": full_prompt,
+                    }, timeout=15)
+                    if re_send and re_send.get("ok"):
+                        continue  # resume polling with new session
+                # Re-registration or re-send failed — fall back
+                logging.getLogger("hitl-mcp").error(
+                    "Re-registration after stale poll failed, falling back."
+                )
+                _daemon_available = False
+                _daemon_last_check = time.time()
+                return _telegram_poll_for_response(
+                    title, prompt, default_value, timeout_seconds=int(remaining),
+                )
+            # Other daemon error — treat as transient
+            time.sleep(2)
             continue
 
         source = poll_result.get("source", "")
