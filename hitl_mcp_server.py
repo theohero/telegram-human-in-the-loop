@@ -20,6 +20,7 @@ import os
 import time
 import atexit
 import re
+import logging
 import urllib.request
 import urllib.error
 import base64
