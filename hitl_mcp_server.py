@@ -1482,7 +1482,8 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
                 f"✅ Whispr enabled!\n\n"
                 f"Model: {cfg.model}\n"
                 f"Language: {cfg.language or 'auto-detect'}\n\n"
-                f"Send a voice message to try it out."
+                f"Send a voice message to try it out.\n\n"
+                f"/whispr_off — Disable"
             ),
         }, timeout=10)
 
@@ -1490,7 +1491,7 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
         cfg.enabled = False
         _telegram_api_call("sendMessage", {
             "chat_id": chat_id,
-            "text": "🔇 Whispr disabled. Voice messages will be ignored.",
+            "text": "🔇 Whispr disabled. Voice messages will be ignored.\n\n/whispr_on — Re-enable",
         }, timeout=10)
 
     elif subcmd.startswith("model"):
