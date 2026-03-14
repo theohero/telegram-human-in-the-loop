@@ -10,6 +10,7 @@ Now supports both Windows and macOS platforms.
 import asyncio
 import json
 import platform
+import random
 import subprocess
 import threading
 import tkinter as tk
@@ -36,6 +37,16 @@ try:
     sys.stderr.reconfigure(encoding='utf-8', errors='ignore')
 except Exception:
     pass
+
+# Configure logging — send to stderr (VS Code captures it) but avoid noise
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s:%(name)s:%(message)s",
+    stream=sys.stderr,
+    force=True,
+)
+# Our logger at INFO level for important messages only
+logging.getLogger("hitl-mcp").setLevel(logging.INFO)
 
 from fastmcp import FastMCP, Context
 from fastmcp.utilities.types import Image as FastMCPImage
@@ -125,7 +136,7 @@ class SessionCoordinator:
     MESSAGE_MAP_FILE = os.path.join(BASE_DIR, "message_map.json")
     ACTIVE_CONTEXT_FILE = os.path.join(BASE_DIR, "active_context.json")
 
-    SESSION_ICONS = ["🔵", "🟢", "🟡", "🟠", "🔴", "🟣", "⚪", "🟤", "⚫"]
+    SESSION_ICONS = ["🦄", "🐙", "🦀", "🐥", "🦋", "🐈", "🐨", "🦥", "🐛", "🐝", "🦩"]
 
     def __init__(self):
         self.session_id: Optional[str] = None
@@ -336,9 +347,17 @@ class SessionCoordinator:
         else:
             self.session_number = len(data["sessions"]) + 1
 
+        # Pick a random icon not used by other active sessions
+        used_icons = {info.get("icon", "") for info in data["sessions"].values()}
+        available = [i for i in self.SESSION_ICONS if i not in used_icons]
+        if not available:
+            available = list(self.SESSION_ICONS)
+        self._session_icon = random.choice(available)
+
         self.session_id = f"s{self.session_number}_{self.pid}"
         data["sessions"][self.session_id] = {
             "number": self.session_number,
+            "icon": self._session_icon,
             "workspace": self.workspace_name,
             "pid": self.pid,
             "started": time.time(),
@@ -386,12 +405,13 @@ class SessionCoordinator:
         result = []
         for sid, info in data["sessions"].items():
             n = info["number"]
+            icon = info.get("icon") or (self.SESSION_ICONS[n - 1] if n <= len(self.SESSION_ICONS) else "🔷")
             result.append({
                 "session_id": sid,
                 "number": n,
                 "workspace": info["workspace"],
                 "pid": info["pid"],
-                "icon": self.SESSION_ICONS[n - 1] if n <= len(self.SESSION_ICONS) else "🔷",
+                "icon": icon,
             })
         return sorted(result, key=lambda s: s["number"])
 
@@ -405,7 +425,7 @@ class SessionCoordinator:
 
     def format_tag(self) -> str:
         n = self.session_number or 0
-        icon = self.SESSION_ICONS[n - 1] if 0 < n <= len(self.SESSION_ICONS) else "🔷"
+        icon = getattr(self, '_session_icon', None) or (self.SESSION_ICONS[n - 1] if 0 < n <= len(self.SESSION_ICONS) else "🔷")
         return f"{icon} #{n} · {self.workspace_name}"
 
     def build_inline_keyboard(self) -> List[List[Dict]]:
@@ -577,257 +597,6 @@ def _telegram_api_call(method: str, payload: Dict[str, Any], timeout: int = 35) 
     return parsed
 
 
-# ── Daemon Adapter ─────────────────────────────────────────────────────────
-#
-# When the HITL daemon is running, the MCP server delegates Telegram
-# communication to the daemon via its HTTP API instead of calling
-# getUpdates directly.  This avoids update-stealing: only the daemon
-# polls Telegram, and routes replies back through /poll.
-
-_daemon_url: Optional[str] = None          # e.g. "http://127.0.0.1:19876"
-_daemon_session_id: Optional[str] = None   # assigned by POST /register
-_daemon_available: Optional[bool] = None   # cached after first probe
-_daemon_secret: str = ""                   # optional shared secret
-_daemon_check_interval: float = 60.0       # re-probe interval (seconds)
-_daemon_last_check: float = 0.0
-
-
-def _daemon_http(method: str, path: str, body: Optional[dict] = None,
-                 timeout: int = 70) -> Optional[dict]:
-    """Make an HTTP request to the daemon. Returns parsed JSON or None on error.
-
-    For HTTP error responses (4xx, 5xx), attempts to parse the error body and
-    returns it as a dict (usually containing an 'error' key).
-    """
-    url = f"{_daemon_url}{path}"
-    headers = {"Content-Type": "application/json"}
-    if _daemon_secret:
-        headers["Authorization"] = f"Bearer {_daemon_secret}"
-
-    try:
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        else:
-            req = urllib.request.Request(url, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        # Parse JSON error body from daemon (e.g. {"error": "Session ... not found"})
-        try:
-            err_body = json.loads(e.read().decode("utf-8"))
-            logging.getLogger("hitl-mcp").debug(
-                "Daemon HTTP %s %s → %d: %s", method, path, e.code, err_body
-            )
-            return err_body
-        except Exception:
-            logging.getLogger("hitl-mcp").debug(
-                "Daemon HTTP %s %s → %d", method, path, e.code
-            )
-            return None
-    except Exception as e:
-        logging.getLogger("hitl-mcp").debug("Daemon HTTP %s %s failed: %s", method, path, e)
-        return None
-
-
-def _daemon_check() -> bool:
-    """Return True if the HITL daemon is reachable. Caches result briefly."""
-    global _daemon_available, _daemon_last_check, _daemon_url, _daemon_secret
-
-    now = time.time()
-    if _daemon_available is not None and (now - _daemon_last_check) < _daemon_check_interval:
-        return _daemon_available
-
-    _daemon_url = os.getenv("HITL_DAEMON_URL", "http://127.0.0.1:19876").rstrip("/")
-    _daemon_secret = os.getenv("HITL_DAEMON_SECRET", "").strip()
-
-    result = _daemon_http("GET", "/health", timeout=3)
-    _daemon_last_check = now
-    _daemon_available = result is not None and result.get("status") == "ok"
-
-    if _daemon_available:
-        logging.getLogger("hitl-mcp").info("Daemon detected at %s", _daemon_url)
-    return _daemon_available
-
-
-def _daemon_register() -> Optional[str]:
-    """Register with the daemon and return the session_id, or None on failure."""
-    global _daemon_session_id
-
-    if _daemon_session_id:
-        return _daemon_session_id
-
-    workspace = os.getenv("HITL_SESSION_NAME", "").strip()
-    if not workspace:
-        workspace = os.path.basename(os.getcwd()) or "mcp-session"
-
-    result = _daemon_http("POST", "/register", {
-        "workspace_name": workspace,
-        "pid": os.getpid(),
-    }, timeout=5)
-
-    if result and "session_id" in result:
-        _daemon_session_id = result["session_id"]
-        num = result.get("session_number", "?")
-        icon = result.get("session_icon", "")
-        logging.getLogger("hitl-mcp").info(
-            "Registered with daemon: %s #%s (session=%s)", icon, num, _daemon_session_id
-        )
-        return _daemon_session_id
-
-    logging.getLogger("hitl-mcp").warning("Daemon registration failed: %s", result)
-    return None
-
-
-def _daemon_deregister() -> None:
-    """Deregister from the daemon on shutdown."""
-    global _daemon_session_id
-    if _daemon_session_id and _daemon_url:
-        _daemon_http("POST", "/deregister", {"session_id": _daemon_session_id}, timeout=3)
-        _daemon_session_id = None
-
-
-def _daemon_send_and_poll(
-    title: str,
-    prompt: str,
-    default_value: str = "",
-    timeout_seconds: int = 1800,
-) -> Optional[str]:
-    """Send a prompt and long-poll for reply via the daemon HTTP API.
-
-    Returns the reply text (possibly JSON for __whispr__/__image__), or None on timeout.
-    Uses chunked polling: repeats /poll calls of up to 55s each until the overall
-    timeout expires, keeping the HTTP connection fresh.
-    """
-    global _daemon_session_id, _daemon_available, _daemon_last_check
-
-    session_id = _daemon_register()
-    if not session_id:
-        return None  # registration failed — caller should fall back
-
-    # ── Build prompt text ──
-    full_prompt = prompt
-    if default_value:
-        full_prompt += f"\n\nDefault value:\n{default_value}"
-
-    # ── Send the message ──
-    send_result = _daemon_http("POST", "/send", {
-        "session_id": session_id,
-        "title": title,
-        "prompt": full_prompt,
-    }, timeout=15)
-
-    if not send_result or not send_result.get("ok"):
-        # Session may be stale (daemon restarted) — clear cache and retry once
-        err_msg = str(send_result.get("error", "")) if send_result else ""
-        if "not found" in err_msg.lower() or "unknown" in err_msg.lower():
-            logging.getLogger("hitl-mcp").warning(
-                "Daemon rejected session %s, re-registering...", session_id
-            )
-            _daemon_session_id = None
-            session_id = _daemon_register()
-            if session_id:
-                send_result = _daemon_http("POST", "/send", {
-                    "session_id": session_id,
-                    "title": title,
-                    "prompt": full_prompt,
-                }, timeout=15)
-                if send_result and send_result.get("ok"):
-                    pass  # fall through to polling
-                else:
-                    logging.getLogger("hitl-mcp").error(
-                        "Daemon /send failed after re-register: %s", send_result
-                    )
-                    return None
-            else:
-                return None
-        else:
-            logging.getLogger("hitl-mcp").error("Daemon /send failed: %s", send_result)
-            return None
-
-    # ── Poll for reply (chunked long-poll) ──
-    start = time.time()
-    poll_chunk = min(55, timeout_seconds)  # per-chunk timeout
-    consecutive_http_failures = 0
-    MAX_CONSECUTIVE_FAILURES = 5  # fall back to direct mode after this many
-
-    while True:
-        remaining = timeout_seconds - (time.time() - start)
-        if remaining <= 0:
-            return None
-
-        chunk_timeout = min(poll_chunk, remaining)
-        poll_result = _daemon_http("POST", "/poll", {
-            "session_id": session_id,
-            "timeout_seconds": chunk_timeout,
-        }, timeout=int(chunk_timeout) + 15)  # HTTP timeout > poll timeout
-
-        if poll_result is None:
-            # HTTP error (connection refused, etc.)
-            consecutive_http_failures += 1
-            if consecutive_http_failures >= MAX_CONSECUTIVE_FAILURES:
-                logging.getLogger("hitl-mcp").warning(
-                    "Daemon unreachable after %d consecutive failures, "
-                    "falling back to direct mode.", consecutive_http_failures,
-                )
-                # Invalidate daemon cache so next call uses direct mode
-                _daemon_available = False
-                _daemon_last_check = time.time()
-                _daemon_session_id = None
-                # Fall back to direct Telegram polling for this request
-                return _telegram_poll_for_response(
-                    title, prompt, default_value, timeout_seconds=int(remaining),
-                )
-            time.sleep(1)
-            continue
-
-        consecutive_http_failures = 0  # reset on successful HTTP
-
-        # ── Stale session: daemon restarted and lost our registration ──
-        if not poll_result.get("ok", True):
-            err_msg = str(poll_result.get("error", ""))
-            if "not found" in err_msg.lower() or "unknown" in err_msg.lower():
-                logging.getLogger("hitl-mcp").warning(
-                    "Daemon lost session %s during poll, re-registering...",
-                    session_id,
-                )
-                _daemon_session_id = None
-                new_sid = _daemon_register()
-                if new_sid:
-                    session_id = new_sid
-                    # Re-send the original message under the new session
-                    re_send = _daemon_http("POST", "/send", {
-                        "session_id": session_id,
-                        "title": title,
-                        "prompt": full_prompt,
-                    }, timeout=15)
-                    if re_send and re_send.get("ok"):
-                        continue  # resume polling with new session
-                # Re-registration or re-send failed — fall back
-                logging.getLogger("hitl-mcp").error(
-                    "Re-registration after stale poll failed, falling back."
-                )
-                _daemon_available = False
-                _daemon_last_check = time.time()
-                return _telegram_poll_for_response(
-                    title, prompt, default_value, timeout_seconds=int(remaining),
-                )
-            # Other daemon error — treat as transient
-            time.sleep(2)
-            continue
-
-        source = poll_result.get("source", "")
-        reply = poll_result.get("reply")
-
-        if source in ("live", "pending") and reply is not None:
-            return reply
-
-        # source == "timeout" → loop again until overall timeout
-
-
-# ── End Daemon Adapter ─────────────────────────────────────────────────────
-
-
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
 def _split_telegram_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list:
@@ -936,12 +705,17 @@ def _telegram_download_photo(file_id: str) -> tuple:
         raise RuntimeError("HITL_TELEGRAM_BOT_TOKEN is not set")
     # Step 1: getFile to obtain the file_path on Telegram's server
     result = _telegram_api_call("getFile", {"file_id": file_id})
-    file_path = result["result"]["file_path"]  # e.g. "photos/file_123.jpg"
+    file_path = result.get("result", {}).get("file_path")
+    if not file_path:
+        raise RuntimeError(f"Telegram API getFile returned no file_path for {file_id}")
     # Step 2: Download the actual file bytes
     url = f"https://api.telegram.org/file/bot{token}/{file_path}"
     req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"Failed to download photo {file_id}: {e}") from e
     # Determine MIME type from file extension
     ext = os.path.splitext(file_path)[1].lower()
     mime_map = {
@@ -1736,9 +1510,6 @@ def _send_and_wait_telegram_multiline_input(
 ) -> Optional[str]:
     """Send prompt to Telegram with session tagging and wait for a reply.
 
-    When the HITL daemon is running, delegates to the daemon's HTTP API
-    to avoid update-stealing (both processes calling getUpdates).
-
     Supports multi-instance coordination:
     - Only ONE instance polls Telegram at a time (file-lock).
     - Other instances wait for a response file written by the poller.
@@ -1749,14 +1520,6 @@ def _send_and_wait_telegram_multiline_input(
         4. Single-session fallback
         5. Ambiguous → disambiguation prompt
     """
-    # ── Daemon adapter: delegate if daemon is running ──
-    if _daemon_check():
-        result = _daemon_send_and_poll(title, prompt, default_value, timeout_seconds)
-        if result is not None or _daemon_available:
-            # If daemon is available, always use its result (even None = timeout).
-            # Only fall through to direct polling if daemon probe actually failed.
-            return result
-
     global _telegram_last_update_id, _session_coordinator
     coord = _session_coordinator
 
@@ -1768,7 +1531,7 @@ def _send_and_wait_telegram_multiline_input(
 
     # ── Build tagged message ──
     tag = coord.format_tag() if coord and coord.session_id else ""
-    header = f"🧠 {tag}" if tag else f"🧠 {title}"
+    header = tag if tag else title
     message_lines = [
         header, "",
         prompt, "",
@@ -2342,7 +2105,7 @@ def configure_modern_window(window):
                 # Try to remove window decorations for modern look (Windows 10/11)
                 window.overrideredirect(False)  # Keep decorations for better UX
                 window.attributes('-alpha', 0.98)  # Slight transparency
-            except:
+            except Exception:
                 pass
         
         # Apply platform-specific configurations
@@ -2368,6 +2131,7 @@ def ensure_gui_initialized():
     global _gui_initialized
     with _gui_lock:
         if not _gui_initialized:
+            test_root = None
             try:
                 test_root = tk.Tk()
                 test_root.withdraw()
@@ -2381,11 +2145,16 @@ def ensure_gui_initialized():
                     # Windows-specific configuration (existing behavior)
                     test_root.attributes('-topmost', True)
                 
-                test_root.destroy()
                 _gui_initialized = True
             except Exception as e:
-                print(f"Warning: GUI initialization failed: {e}")
+                logging.getLogger("hitl-mcp").warning("GUI initialization failed: %s", e)
                 _gui_initialized = False
+            finally:
+                if test_root:
+                    try:
+                        test_root.destroy()
+                    except Exception:
+                        pass
         return _gui_initialized
 
 def configure_window_for_platform(window):
@@ -4255,20 +4024,7 @@ def main():
     if is_telegram_enabled():
         print("Telegram transport: ENABLED (get_multiline_input will send+await via Telegram)")
 
-        # ── Daemon detection ──
-        if _daemon_check():
-            sid = _daemon_register()
-            if sid:
-                atexit.register(_daemon_deregister)
-                print(f"HITL Daemon: CONNECTED at {_daemon_url} (session={sid})")
-                print("  → Telegram polling delegated to daemon (no update stealing)")
-            else:
-                print("HITL Daemon: detected but registration FAILED — falling back to direct polling")
-        else:
-            print(f"HITL Daemon: not detected at {_daemon_url or 'http://127.0.0.1:19876'}")
-            print("  → Using direct Telegram polling (start daemon to avoid conflicts)")
-
-        # ── Session coordination (legacy direct-polling mode) ──
+        # ── Session coordination ──
         _session_coordinator = SessionCoordinator()
         num = _session_coordinator.register()
         atexit.register(_session_coordinator.deregister)
@@ -4324,4 +4080,10 @@ def main():
     mcp.run()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logging.getLogger("hitl-mcp").critical("Fatal error in main: %s", e, exc_info=True)
+        sys.exit(1)
