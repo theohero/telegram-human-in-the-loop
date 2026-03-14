@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -184,6 +185,66 @@ def is_available() -> bool:
 def is_enabled() -> bool:
     """Return True if Whispr is both available and enabled in config."""
     return is_available() and get_config().enabled
+
+
+def install_dependencies() -> bool:
+    """Install faster-whisper via pip if not already available.
+
+    Returns True if faster-whisper is importable after the call.
+    """
+    if is_available():
+        return True
+
+    logger.info("Whispr: installing faster-whisper via pip...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "faster-whisper"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+    except Exception as exc:
+        logger.error("Whispr: failed to install faster-whisper: %s", exc)
+        return False
+
+    if is_available():
+        logger.info("Whispr: faster-whisper installed successfully")
+        return True
+
+    logger.error("Whispr: faster-whisper installed but still not importable")
+    return False
+
+
+def ensure_ready() -> Dict[str, Any]:
+    """Install dependencies and pre-load the model.
+
+    Returns a status dict with 'success', 'message', and details.
+    Call this when enabling whispr to avoid delays on first voice message.
+    """
+    # Step 1: ensure faster-whisper is installed
+    if not is_available():
+        if not install_dependencies():
+            return {
+                "success": False,
+                "message": "Failed to install faster-whisper. "
+                           "Try manually: pip install faster-whisper",
+            }
+
+    # Step 2: pre-load the model (triggers download if needed)
+    cfg = get_config()
+    try:
+        transcriber = get_transcriber()
+        transcriber._ensure_model()
+        return {
+            "success": True,
+            "message": f"Whispr ready (model: {cfg.model})",
+            "model": cfg.model,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": f"Model loading failed: {exc}",
+        }
 
 
 # ── Transcriber ────────────────────────────────────────────────────────────

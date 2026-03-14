@@ -84,6 +84,8 @@ try:
         get_config as whispr_get_config,
         get_transcriber as whispr_get_transcriber,
         download_telegram_voice as whispr_download_voice,
+        install_dependencies as whispr_install_deps,
+        ensure_ready as whispr_ensure_ready,
     )
     _WHISPR_IMPORTED = True
 except ImportError:
@@ -1131,7 +1133,30 @@ def _whispr_handle_voice_message(msg: Dict[str, Any], chat_id: str) -> Optional[
     Returns the final approved text, or None if the user cancels.
     This function blocks the current thread (called from the polling loop).
     """
-    if not _WHISPR_IMPORTED or not whispr_is_enabled():
+    if not _WHISPR_IMPORTED:
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": "🎙 Voice messages received but Whispr is not available.\n"
+                    "Enable it with the toggle_whispr tool.",
+        }, timeout=10)
+        return None
+
+    # Auto-setup if enabled in config but dependencies are missing
+    cfg = whispr_get_config()
+    if cfg.enabled and not whispr_is_available():
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": "🎙 Setting up Whispr (installing dependencies)...",
+        }, timeout=10)
+        ready = whispr_ensure_ready()
+        if not ready["success"]:
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": f"❌ Whispr setup failed: {ready['message']}",
+            }, timeout=10)
+            return None
+
+    if not whispr_is_enabled():
         _telegram_api_call("sendMessage", {
             "chat_id": chat_id,
             "text": "🎙 Voice messages received but Whispr is not enabled.\n"
@@ -3896,6 +3921,10 @@ async def toggle_whispr(
     transcribed and sent through a confirmation flow before returning to
     the agent.
 
+    If faster-whisper is not installed, it will be automatically installed.
+    The speech recognition model is pre-downloaded on first enable to avoid
+    delays when the user sends their first voice message.
+
     Args:
         enabled:  True to enable, False to disable Whispr.
         model:    (optional) Whisper model size – tiny, base, small, medium, large-v3.
@@ -3904,18 +3933,30 @@ async def toggle_whispr(
     if not _WHISPR_IMPORTED:
         return {
             "success": False,
-            "error": "Whispr is not available – faster-whisper is not installed. "
-                     "Install it with: pip install faster-whisper",
+            "error": "Whispr module not found. The whispr.py file may be missing "
+                     "from the HITL MCP server directory.",
             "whispr_available": False,
         }
 
     cfg = whispr_get_config()
-    cfg.enabled = enabled
     if model:
         cfg.model = model
     if language:
         cfg.language = language
-    cfg.save()
+
+    if enabled:
+        # Auto-install faster-whisper and pre-download model
+        if ctx:
+            await ctx.info("Setting up Whispr (installing dependencies & downloading model)...")
+        ready = whispr_ensure_ready()
+        if not ready["success"]:
+            return {
+                "success": False,
+                "error": ready["message"],
+                "whispr_available": whispr_is_available(),
+            }
+
+    cfg.enabled = enabled
 
     status_msg = f"Whispr {'enabled' if enabled else 'disabled'}"
     if model:
