@@ -1,6 +1,6 @@
 # 🤖💬 Telegram Human-in-the-Loop MCP Server
 
-> **Let your AI talk to you through Telegram.** This MCP server gives any AI coding assistant the ability to pause, ask you questions, and wait for your reply — right in your Telegram chat. Now with **image support**, **local file browsing**, **window screenshots**, **OCR**, and **voice message transcription**.
+> **Let your AI talk to you through Telegram.** This MCP server gives any AI coding assistant the ability to pause, ask you questions, and wait for your reply — right in your Telegram chat. Now with **rich text formatting**, **image support**, **local file browsing**, **window screenshots**, **OCR**, and **voice message transcription**.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white" />
@@ -29,6 +29,7 @@ This server intercepts those questions and **sends them to your Telegram**. You 
 - AI sends prompts to your Telegram chat
 - You reply with text — AI receives it and continues working
 - Supports multi-line input, choices, confirmations, and info messages
+- **Rich text formatting** — AI messages render with **bold**, *italic*, `inline code`, and ```code blocks``` in Telegram (Markdown → HTML conversion with automatic plain-text fallback)
 - **Auto-splitting** for long messages — messages over 4096 chars are automatically chunked at paragraph/newline/space boundaries with part indicators (📄 1/3, 2/3, etc.)
 
 ### 📸 Image Support (Telegram → AI)
