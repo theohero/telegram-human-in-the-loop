@@ -1519,6 +1519,61 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
                 ),
             }, timeout=10)
 
+    elif subcmd.startswith("prompt"):
+        prompt_parts = subcmd.split(maxsplit=1)
+        if len(prompt_parts) > 1:
+            new_prompt = prompt_parts[1].strip()
+            if new_prompt.lower() in ("none", "clear", "off", ""):
+                cfg.initial_prompt = ""
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "✅ Whispr initial prompt cleared.",
+                }, timeout=10)
+            else:
+                cfg.initial_prompt = new_prompt
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"✅ Whispr initial prompt set to: {new_prompt}\n\n(Helps prime the decoder for expected language/context)",
+                }, timeout=10)
+        else:
+            current = cfg.initial_prompt or "(none)"
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    f"Current initial prompt: {current}\n\n"
+                    "Set a text snippet in the expected language to improve recognition.\n"
+                    "Examples:\n"
+                    "  /whispr prompt Привет, как дела?  (for Russian)\n"
+                    "  /whispr prompt Bonjour, comment ça va?  (for French)\n"
+                    "  /whispr prompt clear  (remove prompt)"
+                ),
+            }, timeout=10)
+
+    elif subcmd.startswith("beam"):
+        beam_parts = subcmd.split(maxsplit=1)
+        if len(beam_parts) > 1 and beam_parts[1].strip().isdigit():
+            new_beam = int(beam_parts[1].strip())
+            if 1 <= new_beam <= 20:
+                cfg.beam_size = new_beam
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"✅ Whispr beam size set to: {new_beam}\n(Higher = better accuracy, slower)",
+                }, timeout=10)
+            else:
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "❌ Beam size must be between 1 and 20.",
+                }, timeout=10)
+        else:
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    f"Current beam size: {cfg.beam_size}\n\n"
+                    "Higher = better accuracy but slower (1-20)\n"
+                    "Usage: /whispr beam 10"
+                ),
+            }, timeout=10)
+
     else:
         # Status
         available = whispr_is_available()
@@ -1530,12 +1585,17 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
                 f"Available: {'✅ Yes' if available else '❌ No (install faster-whisper)'}\n"
                 f"Enabled: {'✅ On' if enabled else '🔇 Off'}\n"
                 f"Model: {cfg.model}\n"
-                f"Language: {cfg.language or 'auto-detect'}\n\n"
+                f"Language: {cfg.language or 'auto-detect'}\n"
+                f"Beam size: {cfg.beam_size}\n"
+                f"VAD filter: {'✅ On' if cfg.vad_filter else '❌ Off'}\n"
+                f"Initial prompt: {cfg.initial_prompt or '(none)'}\n\n"
                 f"Commands:\n"
                 f"/whispr_on — Enable transcription\n"
                 f"/whispr_off — Disable transcription\n"
                 f"/whispr model <name> — Change model\n"
-                f"/whispr lang <code> — Set language"
+                f"/whispr lang <code> — Set language\n"
+                f"/whispr prompt <text> — Set initial prompt for language priming\n"
+                f"/whispr beam <n> — Set beam size (1-20)"
             ),
             "parse_mode": "Markdown",
         }, timeout=10)

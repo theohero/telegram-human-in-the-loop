@@ -94,6 +94,9 @@ MODEL_CACHE = os.path.join(CONFIG_DIR, "whispr_models")
 DEFAULT_MODEL = "base"
 DEFAULT_LANGUAGE = ""          # empty → auto-detect
 DEFAULT_ENABLED = False
+DEFAULT_BEAM_SIZE = 8          # higher = better accuracy for multilingual (default whisper: 5)
+DEFAULT_VAD_FILTER = True      # filter out silence/noise for cleaner transcription
+DEFAULT_INITIAL_PROMPT = ""    # language-priming text, e.g. "Привет" for Russian
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -154,6 +157,41 @@ class WhisprConfig:
     @language.setter
     def language(self, value: str) -> None:
         self._data["language"] = value
+        self._save()
+
+    @property
+    def beam_size(self) -> int:
+        env = os.getenv("HITL_WHISPR_BEAM_SIZE", "").strip()
+        if env and env.isdigit():
+            return int(env)
+        return self._data.get("beam_size", DEFAULT_BEAM_SIZE)
+
+    @beam_size.setter
+    def beam_size(self, value: int) -> None:
+        self._data["beam_size"] = value
+        self._save()
+
+    @property
+    def vad_filter(self) -> bool:
+        env = os.getenv("HITL_WHISPR_VAD_FILTER", "").strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            return True
+        if env in ("0", "false", "no", "off"):
+            return False
+        return self._data.get("vad_filter", DEFAULT_VAD_FILTER)
+
+    @vad_filter.setter
+    def vad_filter(self, value: bool) -> None:
+        self._data["vad_filter"] = value
+        self._save()
+
+    @property
+    def initial_prompt(self) -> str:
+        return os.getenv("HITL_WHISPR_INITIAL_PROMPT", "").strip() or self._data.get("initial_prompt", DEFAULT_INITIAL_PROMPT)
+
+    @initial_prompt.setter
+    def initial_prompt(self, value: str) -> None:
+        self._data["initial_prompt"] = value
         self._save()
 
 
@@ -303,19 +341,29 @@ class WhisprTranscriber:
         self._ensure_model()
 
         lang = language or self._cfg.language or None
-        kwargs: Dict[str, Any] = {}
+        kwargs: Dict[str, Any] = {
+            "beam_size": self._cfg.beam_size,
+            "vad_filter": self._cfg.vad_filter,
+        }
         if lang:
             kwargs["language"] = lang
+        
+        # Initial prompt helps prime the decoder for the expected language
+        prompt = self._cfg.initial_prompt
+        if prompt:
+            kwargs["initial_prompt"] = prompt
 
         segments, info = self._model.transcribe(audio_path, **kwargs)
         text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
 
         result = " ".join(text_parts)
         logger.info(
-            "Whispr: transcribed %.1f s audio → %d chars (lang=%s)",
+            "Whispr: transcribed %.1f s audio → %d chars (lang=%s, beam=%d, vad=%s)",
             info.duration,
             len(result),
             info.language,
+            self._cfg.beam_size,
+            self._cfg.vad_filter,
         )
         return result
 
