@@ -1411,14 +1411,15 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
         if not whispr_is_available():
             _telegram_api_call("sendMessage", {
                 "chat_id": chat_id,
-                "text": (
-                    "⚠️ faster-whisper is not installed.\n"
-                    "Run: `pip install faster-whisper`\n"
-                    "Then restart the MCP server."
-                ),
-                "parse_mode": "Markdown",
+                "text": "🎙 Setting up Whispr (installing dependencies & downloading model)...\nThis may take a minute.",
             }, timeout=10)
-            return
+            ready = whispr_ensure_ready()
+            if not ready["success"]:
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"❌ Whispr setup failed: {ready['message']}",
+                }, timeout=10)
+                return
         cfg.enabled = True
         _telegram_api_call("sendMessage", {
             "chat_id": chat_id,
@@ -1557,11 +1558,19 @@ def _send_and_wait_telegram_multiline_input(
     # ── Build tagged message ──
     tag = coord.format_tag() if coord and coord.session_id else ""
     header = tag if tag else title
+
+    # Whispr status footer
+    if _WHISPR_IMPORTED and whispr_is_enabled():
+        whispr_footer = "🎙 Whispr: ON · /whispr off"
+    else:
+        whispr_footer = "🎙 Whispr: OFF · /whispr on"
+
     message_lines = [
         header, "",
         prompt, "",
         MULTILINE_DELINEATOR,
         "Reply to this message or tap a button below.",
+        whispr_footer,
     ]
     if default_value:
         message_lines.extend(["", "Default value:", default_value])
