@@ -1249,6 +1249,19 @@ def _whispr_handle_voice_message(msg: Dict[str, Any], chat_id: str) -> Optional[
         }, timeout=10)
         return None
 
+    # One-time hint: ask user to set their languages for better accuracy
+    cfg_check = whispr_get_config()
+    if not cfg_check.languages_asked and not cfg_check.languages:
+        cfg_check.languages_asked = True
+        _telegram_api_call("sendMessage", {
+            "chat_id": chat_id,
+            "text": (
+                "💡 Tip: Set your languages to improve transcription accuracy!\n\n"
+                "Example: /whispr languages en,ru,fr\n\n"
+                "This helps Whispr better recognize your speech."
+            ),
+        }, timeout=10)
+
     # ── Confirmation loop ──
     current_text = transcribed_text.strip()
     original_text = current_text
@@ -1499,6 +1512,46 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
                 ),
             }, timeout=10)
 
+    elif subcmd.startswith("languages"):
+        lang_parts = subcmd.split(maxsplit=1)
+        if len(lang_parts) > 1:
+            raw = lang_parts[1].strip()
+            if raw.lower() in ("none", "clear", "off"):
+                cfg.languages = []
+                cfg.languages_asked = True
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": "✅ Language list cleared. Auto-detect will be used.",
+                }, timeout=10)
+            else:
+                langs = [l.strip().lower() for l in raw.replace(" ", ",").split(",") if l.strip()]
+                cfg.languages = langs
+                cfg.languages_asked = True
+                from whispr import LANGUAGE_PRIMERS
+                known = [l for l in langs if l in LANGUAGE_PRIMERS]
+                unknown = [l for l in langs if l not in LANGUAGE_PRIMERS]
+                prompt = cfg.get_effective_prompt()
+                msg = f"✅ Languages set: {', '.join(langs)}"
+                if prompt:
+                    msg += f"\n\nAuto-generated primer: \"{prompt}\""
+                if unknown:
+                    msg += f"\n⚠️ No primer phrases for: {', '.join(unknown)}"
+                _telegram_api_call("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": msg,
+                }, timeout=10)
+        else:
+            current = ", ".join(cfg.languages) if cfg.languages else "(not set)"
+            _telegram_api_call("sendMessage", {
+                "chat_id": chat_id,
+                "text": (
+                    f"Current languages: {current}\n\n"
+                    "Set your languages to auto-generate prompts that improve transcription accuracy.\n\n"
+                    "Usage: /whispr languages en,ru,fr\n"
+                    "Clear: /whispr languages clear"
+                ),
+            }, timeout=10)
+
     elif subcmd.startswith("lang"):
         lang_parts = subcmd.split(maxsplit=1)
         if len(lang_parts) > 1:
@@ -1585,16 +1638,18 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
                 f"Available: {'✅ Yes' if available else '❌ No (install faster-whisper)'}\n"
                 f"Enabled: {'✅ On' if enabled else '🔇 Off'}\n"
                 f"Model: {cfg.model}\n"
-                f"Language: {cfg.language or 'auto-detect'}\n"
+                f"Language filter: {cfg.language or 'auto-detect'}\n"
+                f"My languages: {', '.join(cfg.languages) if cfg.languages else '(not set)'}\n"
                 f"Beam size: {cfg.beam_size}\n"
                 f"VAD filter: {'✅ On' if cfg.vad_filter else '❌ Off'}\n"
-                f"Initial prompt: {cfg.initial_prompt or '(none)'}\n\n"
+                f"Active prompt: {cfg.get_effective_prompt() or '(none)'}\n\n"
                 f"Commands:\n"
                 f"/whispr_on — Enable transcription\n"
                 f"/whispr_off — Disable transcription\n"
                 f"/whispr model <name> — Change model\n"
-                f"/whispr lang <code> — Set language\n"
-                f"/whispr prompt <text> — Set initial prompt for language priming\n"
+                f"/whispr lang <code> — Set language filter\n"
+                f"/whispr languages en,ru,fr — Set your languages\n"
+                f"/whispr prompt <text> — Manual prompt override\n"
                 f"/whispr beam <n> — Set beam size (1-20)"
             ),
             "parse_mode": "Markdown",

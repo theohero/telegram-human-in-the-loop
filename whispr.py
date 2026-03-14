@@ -91,12 +91,31 @@ MODEL_CACHE = os.path.join(CONFIG_DIR, "whispr_models")
 
 # ── Defaults ───────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "base"
+DEFAULT_MODEL = "medium"
 DEFAULT_LANGUAGE = ""          # empty → auto-detect
 DEFAULT_ENABLED = False
 DEFAULT_BEAM_SIZE = 8          # higher = better accuracy for multilingual (default whisper: 5)
 DEFAULT_VAD_FILTER = True      # filter out silence/noise for cleaner transcription
 DEFAULT_INITIAL_PROMPT = ""    # language-priming text, e.g. "Привет" for Russian
+
+# Stock phrases per language for auto-generating initial prompts
+LANGUAGE_PRIMERS = {
+    "en": "Hello, how are you?",
+    "ru": "Привет, как дела?",
+    "fr": "Bonjour, comment ça va?",
+    "de": "Hallo, wie geht es Ihnen?",
+    "es": "Hola, ¿cómo estás?",
+    "it": "Ciao, come stai?",
+    "pt": "Olá, como vai?",
+    "zh": "你好，你好吗？",
+    "ja": "こんにちは、お元気ですか？",
+    "ko": "안녕하세요, 어떻게 지내세요?",
+    "ar": "مرحبا، كيف حالك؟",
+    "uk": "Привіт, як справи?",
+    "pl": "Cześć, jak się masz?",
+    "nl": "Hallo, hoe gaat het?",
+    "tr": "Merhaba, nasılsınız?",
+}
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -193,6 +212,44 @@ class WhisprConfig:
     def initial_prompt(self, value: str) -> None:
         self._data["initial_prompt"] = value
         self._save()
+
+    @property
+    def languages(self) -> list[str]:
+        """List of language codes the user speaks (e.g. ['en', 'ru', 'fr'])."""
+        env = os.getenv("HITL_WHISPR_LANGUAGES", "").strip()
+        if env:
+            return [l.strip().lower() for l in env.split(",") if l.strip()]
+        return self._data.get("languages", [])
+
+    @languages.setter
+    def languages(self, value: list[str]) -> None:
+        self._data["languages"] = value
+        self._save()
+
+    @property
+    def languages_asked(self) -> bool:
+        """Whether we've already asked the user about their languages."""
+        return self._data.get("languages_asked", False)
+
+    @languages_asked.setter
+    def languages_asked(self, value: bool) -> None:
+        self._data["languages_asked"] = value
+        self._save()
+
+    def get_effective_prompt(self) -> str:
+        """Return the initial prompt, auto-generated from languages if not set manually."""
+        manual = self.initial_prompt
+        if manual:
+            return manual
+        langs = self.languages
+        if not langs:
+            return ""
+        # Build a multilingual primer from known phrases
+        phrases = []
+        for lang in langs:
+            if lang in LANGUAGE_PRIMERS:
+                phrases.append(LANGUAGE_PRIMERS[lang])
+        return " ".join(phrases) if phrases else ""
 
 
 # ── Singleton config ───────────────────────────────────────────────────────
@@ -349,7 +406,7 @@ class WhisprTranscriber:
             kwargs["language"] = lang
         
         # Initial prompt helps prime the decoder for the expected language
-        prompt = self._cfg.initial_prompt
+        prompt = self._cfg.get_effective_prompt()
         if prompt:
             kwargs["initial_prompt"] = prompt
 
