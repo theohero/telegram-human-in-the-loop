@@ -648,18 +648,50 @@ def _split_telegram_message(text: str, max_length: int = TELEGRAM_MAX_MESSAGE_LE
     return [c for c in chunks if c.strip()]
 
 
-def _telegram_send_long_message(chat_id: str, text: str, reply_markup: str = None, timeout: int = 20) -> Dict[str, Any]:
+def _markdown_to_telegram_html(text: str) -> str:
+    """Convert simple markdown formatting to Telegram-safe HTML.
+    
+    Handles: **bold**, *italic*, `code`, ```code blocks```.
+    Escapes HTML entities first, then applies formatting.
+    """
+    # Escape HTML entities
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    
+    # Code blocks (```...```) — must be done before inline code
+    text = re.sub(r"```(\w*)\n?(.*?)```", r"<pre>\2</pre>", text, flags=re.DOTALL)
+    
+    # Inline code (`...`)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    
+    # Bold (**...**)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    
+    # Italic (*...*)  — but not inside <b> tags or when preceded by another *
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
+    
+    return text
+
+
+def _telegram_send_long_message(chat_id: str, text: str, reply_markup: str = None, timeout: int = 20, parse_mode: str = None) -> Dict[str, Any]:
     """Send a message to Telegram, automatically splitting if it exceeds 4096 chars.
     
     Returns the API response for the LAST sent message (which is the one the user
     should reply to). reply_markup is only attached to the last chunk.
     """
+    # Convert markdown to HTML if requested
+    if parse_mode == "HTML":
+        text = _markdown_to_telegram_html(text)
+    
     chunks = _split_telegram_message(text)
 
     last_result = None
     for i, chunk in enumerate(chunks):
         is_last = (i == len(chunks) - 1)
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         # Only attach keyboard/markup to the last message
         if is_last and reply_markup:
             payload["reply_markup"] = reply_markup
@@ -670,7 +702,17 @@ def _telegram_send_long_message(chat_id: str, text: str, reply_markup: str = Non
                 payload["text"] = chunk_header + chunk
             else:
                 payload["text"] = chunk_header + chunk
-        last_result = _telegram_api_call("sendMessage", payload, timeout=timeout)
+        try:
+            last_result = _telegram_api_call("sendMessage", payload, timeout=timeout)
+        except Exception:
+            # If HTML parsing fails, retry without parse_mode
+            if parse_mode:
+                payload.pop("parse_mode", None)
+                # Re-split with original (non-HTML) text for fallback
+                payload["text"] = payload["text"]  # already has chunk text
+                last_result = _telegram_api_call("sendMessage", payload, timeout=timeout)
+            else:
+                raise
         # Small delay between chunks to avoid rate limiting
         if not is_last:
             time.sleep(0.3)
@@ -1160,7 +1202,7 @@ def _whispr_handle_voice_message(msg: Dict[str, Any], chat_id: str) -> Optional[
         _telegram_api_call("sendMessage", {
             "chat_id": chat_id,
             "text": "🎙 Voice messages received but Whispr is not enabled.\n"
-                    "Enable it with /whispr on",
+                    "Enable it with /whispr_on",
         }, timeout=10)
         return None
 
@@ -1490,8 +1532,8 @@ def _handle_whispr_command(text: str, chat_id: str) -> None:
                 f"Model: {cfg.model}\n"
                 f"Language: {cfg.language or 'auto-detect'}\n\n"
                 f"Commands:\n"
-                f"/whispr on — Enable transcription\n"
-                f"/whispr off — Disable transcription\n"
+                f"/whispr_on — Enable transcription\n"
+                f"/whispr_off — Disable transcription\n"
                 f"/whispr model <name> — Change model\n"
                 f"/whispr lang <code> — Set language"
             ),
@@ -1514,8 +1556,8 @@ def _handle_help_command(chat_id: str) -> None:
             "📋 /sessions — List active agent sessions\n"
             "📝 /r{n} — Reply to session #n\n"
             f"🎙 /whispr — Voice transcription settings\n"
-            f"  /whispr on — Enable Whispr\n"
-            f"  /whispr off — Disable Whispr\n"
+            f"  /whispr_on — Enable Whispr\n"
+            f"  /whispr_off — Disable Whispr\n"
             f"  /whispr model <name> — Set model (tiny/base/small/medium/large-v3)\n"
             f"  /whispr lang <code> — Set language (en/ru/auto)\n"
             "📷 **Images** — Send a photo or image file and it will be forwarded to the AI model\n"
@@ -1561,9 +1603,9 @@ def _send_and_wait_telegram_multiline_input(
 
     # Whispr status footer
     if _WHISPR_IMPORTED and whispr_is_enabled():
-        whispr_footer = "🎙 Whispr: ON · /whispr off"
+        whispr_footer = "🎙 Whispr: ON · /whispr_off"
     else:
-        whispr_footer = "🎙 Whispr: OFF · /whispr on"
+        whispr_footer = "🎙 Whispr: OFF · /whispr_on"
 
     message_lines = [
         header, "",
@@ -1580,7 +1622,7 @@ def _send_and_wait_telegram_multiline_input(
     full_text = "\n".join(message_lines)
     reply_markup = json.dumps({"inline_keyboard": keyboard}) if keyboard else None
 
-    sent = _telegram_send_long_message(chat_id, full_text, reply_markup=reply_markup, timeout=20)
+    sent = _telegram_send_long_message(chat_id, full_text, reply_markup=reply_markup, timeout=20, parse_mode="HTML")
     sent_message_id = sent.get("result", {}).get("message_id")
 
     if coord and sent_message_id:
@@ -1709,7 +1751,7 @@ def _send_and_wait_telegram_multiline_input(
                         else:
                             _telegram_api_call("sendMessage", {
                                 "chat_id": chat_id,
-                                "text": "🎙 Voice message received. Enable Whispr to auto-transcribe: /whispr on",
+                                "text": "🎙 Voice message received. Enable Whispr to auto-transcribe: /whispr_on",
                             }, timeout=10)
                             continue
 
@@ -1821,9 +1863,12 @@ def _send_and_wait_telegram_multiline_input(
                         if text is None:
                             continue
 
-                    # /whispr command
-                    if text.strip().lower().startswith("/whispr"):
-                        _handle_whispr_command(text.strip(), chat_id)
+                    # /whispr command (also /whispr_on, /whispr_off shortcuts)
+                    cmd_lower = text.strip().lower()
+                    if cmd_lower.startswith("/whispr"):
+                        # Convert underscore shortcuts: /whispr_on → /whispr on
+                        normalized = cmd_lower.replace("/whispr_on", "/whispr on").replace("/whispr_off", "/whispr off")
+                        _handle_whispr_command(normalized, chat_id)
                         continue
 
                     # /help command (updated with Whispr info)
