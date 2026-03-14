@@ -296,14 +296,62 @@ The screenshot is returned as:
 
 ## 🎤 Voice Message Support (Whispr)
 
-The server includes an optional **Whispr** module for local voice transcription:
+The server includes an optional **Whispr** module for local voice-to-text transcription using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2-based Whisper).
+
+### How It Works
 
 1. You send a voice message in Telegram
-2. Whispr downloads and transcribes it locally using a Whisper model
+2. Whispr downloads the audio and transcribes it locally using a Whisper model
 3. The transcribed text is sent to the AI as a regular text response
-4. Metadata includes original transcription and any LLM-powered edits
+4. Metadata includes original transcription and any edits
 
-Toggle Whispr with the `toggle_whispr` tool. Requires a local Whisper model to be configured.
+### Setup — Zero Configuration
+
+Whispr auto-installs everything when you first enable it:
+
+- **From Telegram:** Tap `/whispr_on` in any message footer (shown at the bottom of every AI message)
+- **From AI:** The `toggle_whispr` MCP tool auto-installs dependencies and downloads the model
+
+No `pip install`, no model downloads, no terminal — just tap and go.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/whispr_on` | Enable voice transcription (auto-installs if needed) |
+| `/whispr_off` | Disable voice transcription |
+| `/whispr status` | Show current Whispr status and settings |
+| `/whispr model <name>` | Change model: `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `/whispr lang <code>` | Set language: `en`, `ru`, `de`, `fr`, `auto` |
+
+### Message Footer
+
+Every AI message includes a Whispr status footer at the bottom:
+
+```
+🎙 Whispr: OFF · /whispr_on     ← tap to enable
+🎙 Whispr: ON  · /whispr_off    ← tap to disable
+```
+
+### Models
+
+| Model | Size | Speed | Accuracy | Best for |
+|-------|------|-------|----------|----------|
+| `tiny` | ~75 MB | Fastest | Basic | Quick notes, short phrases |
+| `base` | ~150 MB | Fast | Good | General use (default) |
+| `small` | ~500 MB | Medium | Better | Longer messages |
+| `medium` | ~1.5 GB | Slower | High | Detailed transcription |
+| `large-v3` | ~3 GB | Slowest | Best | Maximum accuracy |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HITL_WHISPR_ENABLED` | `false` | Enable Whispr on server start |
+| `HITL_WHISPR_MODEL` | `base` | Whisper model to use |
+| `HITL_WHISPR_LANGUAGE` | (auto) | Language code, or empty for auto-detect |
+
+Models are cached locally in `~/.hitl-mcp/whispr_models/`.
 
 ---
 
@@ -341,6 +389,9 @@ A: Text communication and image support work everywhere. Window screenshots (`ge
 | `HITL_TELEGRAM_TIMEOUT_SECONDS` | `3600` | How long to wait for a reply (seconds) |
 | `HITL_IMAGE_TOOLS_ENABLED` | `true` | Enable/disable `get_image` and `list_images` tools |
 | `HITL_OCR_ENABLED` | `true` | Enable/disable OCR text extraction from images |
+| `HITL_WHISPR_ENABLED` | `false` | Enable voice transcription on server start |
+| `HITL_WHISPR_MODEL` | `base` | Whisper model size (`tiny`/`base`/`small`/`medium`/`large-v3`) |
+| `HITL_WHISPR_LANGUAGE` | (auto) | Language code for transcription (`en`, `ru`, `de`, etc.) |
 | `FASTMCP_LOG_LEVEL` | `INFO` | Logging level |
 
 ---
